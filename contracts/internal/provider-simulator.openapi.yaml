@@ -1,0 +1,162 @@
+openapi: 3.1.0
+info:
+  title: Provider Simulator API
+  version: 0.1.0
+  description: Development and CI only. This API must never be configured as a live payment provider.
+servers:
+  - url: http://simulator:8083
+paths:
+  /livez:
+    get:
+      operationId: getProviderSimulatorLiveness
+      summary: Report process liveness
+      security: []
+      responses:
+        "204":
+          description: Provider Simulator process is alive.
+  /readyz:
+    get:
+      operationId: getProviderSimulatorReadiness
+      summary: Report readiness
+      security: []
+      responses:
+        "204":
+          description: Provider Simulator is ready to receive test operations.
+  /metrics:
+    get:
+      operationId: getProviderSimulatorMetrics
+      summary: Return Prometheus process metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/sales:
+    post:
+      operationId: createSimulatedSale
+      summary: Simulate one idempotent automatic-capture payment operation
+      security: []
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+          description: The simulator trims surrounding whitespace; the implementation limit is 200 UTF-8 bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SaleRequest"
+      responses:
+        "200":
+          description: A conclusive simulated result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SaleResponse"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+  /v1/sales/{idempotency_key}:
+    get:
+      operationId: getSimulatedSale
+      summary: Query the result of an existing simulated operation
+      security: []
+      parameters:
+        - in: path
+          name: idempotency_key
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+      responses:
+        "200":
+          description: Current simulated provider result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SaleResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+components:
+  responses:
+    ErrorResponse:
+      description: Request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    SaleRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - amount_minor
+        - currency
+        - payment_method_token
+        - capture_method
+      properties:
+        operation_id:
+          type: string
+          minLength: 1
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        payment_method_token:
+          type: string
+          pattern: "^pm_sim_"
+        capture_method:
+          type: string
+          const: automatic
+        scenario:
+          type: string
+          enum: [approved, declined, timeout_then_succeeded, timeout_then_declined]
+        webhook_url:
+          type: string
+          minLength: 1
+    SaleResponse:
+      type: object
+      additionalProperties: false
+      required: [provider, operation_id, provider_reference, status]
+      properties:
+        provider:
+          type: string
+        operation_id:
+          type: string
+        provider_reference:
+          type: string
+        status:
+          type: string
+          enum: [succeeded, declined]
+        failure_code:
+          type: string
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/APIError"
+    APIError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string

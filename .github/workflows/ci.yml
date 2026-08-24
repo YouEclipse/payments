@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: payments_test
+          POSTGRES_USER: payments
+          POSTGRES_PASSWORD: payments-test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U payments -d payments_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      PAYMENTS_ENVIRONMENT: test
+      TEST_DATABASE_URL: postgres://payments:payments-test-only@127.0.0.1:5432/payments_test?sslmode=disable
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache: false
+
+      - name: Verify source and build
+        run: make ci
+
+      - name: Validate OpenAPI contracts
+        run: make contracts-check
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Build service images
+        run: make docker-build
+
+      - name: Start complete payment stack
+        env:
+          POSTGRES_PORT: "55432"
+        run: docker compose -f deploy/compose/compose.yaml up --build --wait --wait-timeout 120
+
+      - name: Run payment flow end to end
+        env:
+          PAYMENT_API_BASE_URL: http://127.0.0.1:8080
+          PAYMENT_TEST_API_KEY: local-api-key
+          E2E_DATABASE_URL: postgres://payments:payments-local-only@127.0.0.1:55432/payments?sslmode=disable
+        run: make test-e2e
+
+      - name: Print stack logs after a failure
+        if: failure()
+        env:
+          POSTGRES_PORT: "55432"
+        run: docker compose -f deploy/compose/compose.yaml logs --no-color
+
+      - name: Stop complete payment stack
+        if: always()
+        env:
+          POSTGRES_PORT: "55432"
+        run: docker compose -f deploy/compose/compose.yaml down --volumes --remove-orphans

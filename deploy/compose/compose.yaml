@@ -1,0 +1,154 @@
+name: payments-local
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  networks:
+    - payments
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments-local-only}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - payments
+
+  payment:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: payment
+        SERVICE_PATH: ./services/payment/cmd/api
+    environment:
+      PAYMENTS_ENVIRONMENT: ${PAYMENTS_ENVIRONMENT:-local}
+      HTTP_ADDR: :8080
+      DATABASE_URL: ${PAYMENT_DATABASE_URL:-postgres://payments:payments-local-only@postgres:5432/payments?sslmode=disable}
+      ROUTER_BASE_URL: http://router:8081
+      PROVIDER_GATEWAY_BASE_URL: http://gateway:8082
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
+      PAYMENT_API_KEYS: ${PAYMENT_API_KEYS:-merchant_demo=local-api-key}
+    ports:
+      - "${PAYMENT_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      router:
+        condition: service_healthy
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  router:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: router
+        SERVICE_PATH: ./services/router/cmd/server
+    environment:
+      PAYMENTS_ENVIRONMENT: ${PAYMENTS_ENVIRONMENT:-local}
+      ROUTER_HTTP_ADDR: :8081
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
+    ports:
+      - "${ROUTER_PORT:-8081}:8081"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  gateway:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: gateway
+        SERVICE_PATH: ./services/provider-gateway/cmd/server
+    environment:
+      PAYMENTS_ENVIRONMENT: ${PAYMENTS_ENVIRONMENT:-local}
+      HTTP_ADDR: :8082
+      DATABASE_URL: ${GATEWAY_DATABASE_URL:-postgres://payments:payments-local-only@postgres:5432/payments?sslmode=disable}
+      MIGRATE_ON_START: "true"
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
+      PROVIDER_ENDPOINTS: simulator_a=http://simulator:8083
+      PROVIDER_WEBHOOK_SECRETS: simulator_a=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
+      GATEWAY_WEBHOOK_BASE_URL: http://gateway:8082
+      PAYMENT_OUTCOME_URL: http://payment:8080/internal/v1/provider-outcomes
+      PROVIDER_REQUEST_TIMEOUT: 300ms
+    ports:
+      - "${GATEWAY_PORT:-8082}:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      simulator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8082/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  simulator:
+    <<: *service-defaults
+    build:
+      context: ../..
+      dockerfile: deploy/Dockerfile
+      args:
+        SERVICE: simulator
+        SERVICE_PATH: ./tools/provider-simulator/cmd/server
+    environment:
+      PAYMENTS_ENVIRONMENT: ${PAYMENTS_ENVIRONMENT:-local}
+      HTTP_ADDR: :8083
+      PROVIDER_ID: ${PROVIDER_ID:-simulator_a}
+      PROVIDER_WEBHOOK_SECRET: ${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
+      PROVIDER_WEBHOOK_DELAY: 3s
+      PROVIDER_TIMEOUT_DELAY: 4s
+    ports:
+      - "${SIMULATOR_PORT:-8083}:8083"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8083/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  postgres-data:
+
+networks:
+  payments:
+    driver: bridge

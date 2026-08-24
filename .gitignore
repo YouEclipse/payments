@@ -1,0 +1,23 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Go build and test output
+/bin/
+/dist/
+/coverage/
+*.coverprofile
+*.test
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data
+/tmp/
+*.log

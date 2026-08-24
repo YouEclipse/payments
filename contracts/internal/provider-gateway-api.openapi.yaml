@@ -1,0 +1,282 @@
+openapi: 3.1.0
+info:
+  title: Provider Gateway Internal API
+  version: 0.1.0
+  description: |
+    Internal provider-operation and signed-webhook contract. Merchant API keys
+    and raw card data are forbidden; callers submit tokenized payment methods.
+servers:
+  - url: http://gateway:8082
+paths:
+  /livez:
+    get:
+      operationId: getProviderGatewayLiveness
+      summary: Report process liveness
+      security: []
+      responses:
+        "204":
+          description: Provider Gateway process is alive.
+  /readyz:
+    get:
+      operationId: getProviderGatewayReadiness
+      summary: Report persistence readiness
+      security: []
+      responses:
+        "204":
+          description: Required persistence is available.
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+  /metrics:
+    get:
+      operationId: getProviderGatewayMetrics
+      summary: Return Prometheus process metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /internal/v1/provider-operations:
+    post:
+      operationId: executeProviderOperation
+      summary: Execute one logical provider operation
+      description: Reusing operation_id is idempotent only when every semantic request field is identical.
+      security:
+        - InternalServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderOperationRequest"
+      responses:
+        "200":
+          description: Conclusive or previously stored provider operation result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderOperation"
+        "202":
+          description: Provider outcome is unknown and must be reconciled using this operation_id.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderOperation"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+  /internal/v1/provider-operations/{operation_id}:
+    get:
+      operationId: getProviderOperation
+      summary: Read or reconcile an existing provider operation
+      security:
+        - InternalServiceToken: []
+      parameters:
+        - $ref: "#/components/parameters/OperationID"
+        - in: query
+          name: reconcile
+          description: |
+            Reconcile a nonterminal operation against the same provider. A
+            durable operation that was never dispatched may return the
+            operation_resubmit_required recovery signal so the caller can
+            resubmit the identical request with the same operation ID.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Current normalized provider operation state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderOperation"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/ErrorResponse"
+  /webhooks/{provider}:
+    post:
+      operationId: ingestProviderWebhook
+      summary: Receive a signed provider event
+      description: The event is durably deduplicated before acknowledgement and delivered through the gateway outbox.
+      security: []
+      parameters:
+        - in: path
+          name: provider
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - in: header
+          name: X-Provider-Signature
+          required: true
+          description: Lowercase or uppercase hexadecimal HMAC-SHA256 over the exact request body.
+          schema:
+            type: string
+            pattern: "^[A-Fa-f0-9]{64}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderWebhookEvent"
+      responses:
+        "204":
+          description: Event was stored or had already been processed.
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+components:
+  securitySchemes:
+    InternalServiceToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: Shared internal service credential. It is never a merchant API key.
+  parameters:
+    OperationID:
+      in: path
+      name: operation_id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    ErrorResponse:
+      description: Request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    ProviderOperationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - attempt_id
+        - provider
+        - amount_minor
+        - currency
+        - payment_method_token
+        - capture_method
+      properties:
+        operation_id:
+          type: string
+          minLength: 1
+        attempt_id:
+          type: string
+          minLength: 1
+        provider:
+          type: string
+          minLength: 1
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        payment_method_token:
+          type: string
+          minLength: 1
+          description: Token or vault reference only. Raw PAN and CVV are forbidden.
+        capture_method:
+          type: string
+          const: automatic
+        scenario:
+          type: string
+          minLength: 1
+          description: Development/test-only simulator override; rejected outside development and test environments.
+    ProviderOperation:
+      type: object
+      additionalProperties: false
+      required:
+        - operation_id
+        - attempt_id
+        - provider
+        - provider_idempotency_key
+        - status
+        - side_effect_certainty
+        - created_at
+        - updated_at
+      properties:
+        operation_id:
+          type: string
+        attempt_id:
+          type: string
+        provider:
+          type: string
+        provider_idempotency_key:
+          type: string
+          description: Equals operation_id in the first release.
+        status:
+          type: string
+          enum: [created, sending, unknown, succeeded, failed, review_required]
+        side_effect_certainty:
+          type: string
+          enum: [none, possible, confirmed]
+        provider_reference:
+          type: string
+        failure_code:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ProviderWebhookEvent:
+      type: object
+      required: [event_id, provider, operation_id, status]
+      properties:
+        event_id:
+          type: string
+          minLength: 1
+        provider:
+          type: string
+          minLength: 1
+          description: Must equal the provider path parameter.
+        operation_id:
+          type: string
+          minLength: 1
+        provider_reference:
+          type: string
+        status:
+          type: string
+          enum: [authorized, captured, succeeded, declined, failed]
+        failure_code:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/APIError"
+    APIError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string

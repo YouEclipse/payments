@@ -1,0 +1,275 @@
+openapi: 3.1.0
+info:
+  title: Payment Router Internal API
+  version: 0.1.0
+  description: |
+    Internal contract for deterministic provider eligibility and static routing.
+    The Router owns provider capabilities and the active policy. Callers send
+    only non-sensitive routing context; credentials and tokens are forbidden.
+servers:
+  - url: http://router:8081
+paths:
+  /livez:
+    get:
+      operationId: getRouterLiveness
+      summary: Process liveness probe
+      security: []
+      responses:
+        "200":
+          description: Router process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      operationId: getRouterReadiness
+      summary: Router readiness probe
+      security: []
+      responses:
+        "200":
+          description: Router is ready to accept decisions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /metrics:
+    get:
+      operationId: getRouterMetrics
+      summary: Return Prometheus process metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+        "405":
+          $ref: "#/components/responses/ErrorResponse"
+  /internal/v1/routing-decisions:
+    post:
+      operationId: createRoutingDecision
+      summary: Select an eligible provider using a versioned static policy
+      description: |
+        Applies Router-owned hard eligibility constraints before Router-owned
+        static provider ordering. The response is deterministic for the same
+        context, capability snapshot, and policy version.
+      security:
+        - InternalServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoutingDecisionRequest"
+            example:
+              payment_id: pi_0123456789abcdef0123456789abcdef
+              attempt_id: att_01JABC
+              merchant_id: merchant_aurora
+              amount_minor: 2599
+              currency: USD
+              payment_method: card
+              operation: sale
+      responses:
+        "200":
+          description: Routing decision created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutingDecision"
+        "400":
+          description: Malformed or invalid request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "413":
+          description: Request body exceeds the service limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "415":
+          description: Content-Type is not application/json.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          description: No candidate is eligible under the active policy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoEligibleProviderResponse"
+        "500":
+          $ref: "#/components/responses/ErrorResponse"
+components:
+  securitySchemes:
+    InternalServiceToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+      description: Shared internal service credential. It is never a merchant API key.
+  responses:
+    ErrorResponse:
+      description: Request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    RoutingDecisionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - payment_id
+        - attempt_id
+        - merchant_id
+        - amount_minor
+        - currency
+        - payment_method
+        - operation
+      properties:
+        payment_id:
+          type: string
+          minLength: 1
+        attempt_id:
+          type: string
+          minLength: 1
+        merchant_id:
+          type: string
+          minLength: 1
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Amount in the currency's minor unit. Floating point amounts are forbidden.
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+          example: USD
+        payment_method:
+          type: string
+          enum: [card]
+          description: Non-sensitive payment method category such as card; never a credential or token.
+        operation:
+          type: string
+          enum: [sale, authorize]
+          description: sale is authorization with automatic capture; authorize reserves funds for later capture.
+
+    RoutingDecision:
+      type: object
+      additionalProperties: false
+      required:
+        - decision_id
+        - selected_provider
+        - candidate_order
+        - exclusions
+        - policy_version
+      properties:
+        decision_id:
+          type: string
+          pattern: "^rtd_[a-f0-9]{24}$"
+        selected_provider:
+          type: string
+          minLength: 1
+        candidate_order:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        exclusions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProviderExclusion"
+        policy_version:
+          type: string
+
+    ProviderExclusion:
+      type: object
+      additionalProperties: false
+      required: [provider, reasons]
+      properties:
+        provider:
+          type: string
+        reasons:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ExclusionReason"
+
+    ExclusionReason:
+      type: object
+      additionalProperties: false
+      required: [code, detail]
+      properties:
+        code:
+          type: string
+          enum:
+            - provider_disabled
+            - currency_not_supported
+            - payment_method_not_supported
+            - operation_not_supported
+            - not_in_policy
+        detail:
+          type: string
+
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/APIError"
+
+    APIError:
+      type: object
+      additionalProperties: false
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        field:
+          type: string
+
+    NoEligibleProviderResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - error
+        - decision_id
+        - candidate_order
+        - exclusions
+        - policy_version
+      properties:
+        error:
+          $ref: "#/components/schemas/APIError"
+        decision_id:
+          type: string
+          pattern: "^rtd_[a-f0-9]{24}$"
+        candidate_order:
+          type: array
+          maxItems: 0
+          items:
+            type: string
+        exclusions:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/ProviderExclusion"
+        policy_version:
+          type: string

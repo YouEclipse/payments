@@ -1,0 +1,398 @@
+openapi: 3.1.0
+info:
+  title: Payments API
+  version: 0.1.0
+  description: |
+    Merchant-facing Payment Intent API for tokenized one-time card payments.
+    The first release supports automatic capture only. A `processing` response
+    can represent an UNKNOWN provider result; clients must retrieve the same
+    Payment Intent instead of creating another charge.
+servers:
+  - url: http://localhost:8080
+paths:
+  /livez:
+    get:
+      operationId: getPaymentLiveness
+      summary: Report process liveness
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      operationId: getPaymentReadiness
+      summary: Report persistence readiness
+      security: []
+      responses:
+        "200":
+          description: Required persistence is available.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+  /metrics:
+    get:
+      operationId: getPaymentMetrics
+      summary: Return Prometheus process metrics
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/payment_intents:
+    post:
+      operationId: createPaymentIntent
+      summary: Create an immutable payment intent
+      security:
+        - MerchantAPIKey: []
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentIntentRequest"
+            example:
+              merchant_reference: order_2048
+              amount_minor: 2599
+              currency: USD
+              payment_method_token: pm_sim_approved
+              capture_method: automatic
+      responses:
+        "201":
+          description: Payment Intent created. An identical idempotent replay returns this same response.
+          headers:
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentIntent"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "415":
+          $ref: "#/components/responses/ErrorResponse"
+  /v1/payment_intents/{intent_id}/confirm:
+    post:
+      operationId: confirmPaymentIntent
+      summary: Route and execute one automatic-capture provider operation
+      description: |
+        Creates at most one Payment Attempt and one logical Provider Operation.
+        A provider timeout returns `processing` with HTTP 202. The service keeps
+        the original operation and idempotency key and reconciles it; it never
+        interprets timeout as a safe reason to charge through another provider.
+      security:
+        - MerchantAPIKey: []
+      parameters:
+        - $ref: "#/components/parameters/IntentID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: A conclusive payment result.
+          headers:
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentIntent"
+        "202":
+          description: Provider result is pending or unknown and is being reconciled.
+          headers:
+            Idempotent-Replayed:
+              $ref: "#/components/headers/IdempotentReplayed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentIntent"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+        "409":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ErrorResponse"
+  /v1/payment_intents/{intent_id}:
+    get:
+      operationId: getPaymentIntent
+      summary: Retrieve the current authoritative Payment Intent projection
+      security:
+        - MerchantAPIKey: []
+      parameters:
+        - $ref: "#/components/parameters/IntentID"
+      responses:
+        "200":
+          description: Current Payment Intent.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PaymentIntent"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+  /internal/v1/provider-outcomes:
+    post:
+      operationId: ingestProviderOutcome
+      summary: Ingest one normalized provider outcome
+      description: |
+        Internal-only durable inbox. Duplicate `event_id` values are accepted
+        idempotently. Terminal conflicts set `integrity_status=review_required`
+        instead of overwriting confirmed financial facts.
+      security:
+        - InternalServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderOutcome"
+      responses:
+        "202":
+          description: Outcome durably accepted or identified as a duplicate.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [accepted, duplicate, quarantined]
+                properties:
+                  accepted:
+                    type: boolean
+                    const: true
+                  duplicate:
+                    type: boolean
+                  quarantined:
+                    type: boolean
+                    description: True when the event was durably isolated and did not advance financial state.
+                  payment_intent_id:
+                    type: string
+                    description: Present when the event correlated to a known Payment Intent.
+                  integrity_status:
+                    $ref: "#/components/schemas/IntegrityStatus"
+        "400":
+          $ref: "#/components/responses/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "404":
+          $ref: "#/components/responses/ErrorResponse"
+components:
+  securitySchemes:
+    MerchantAPIKey:
+      type: http
+      scheme: bearer
+      bearerFormat: merchant-api-key
+      description: Merchant-scoped API key. It must never be sent to Router or Provider Gateway.
+    InternalServiceToken:
+      type: apiKey
+      in: header
+      name: X-Internal-Token
+  parameters:
+    IntentID:
+      in: path
+      name: intent_id
+      required: true
+      schema:
+        type: string
+        pattern: "^pi_[a-f0-9]{32}$"
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: true
+      description: Globally unique within a merchant. Reuse with another operation or payload returns HTTP 409.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: "^[!-~]+$"
+  headers:
+    IdempotentReplayed:
+      description: Present and true when the stored response for the same request was replayed.
+      schema:
+        type: string
+        const: "true"
+  responses:
+    ErrorResponse:
+      description: Request failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+  schemas:
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          const: ok
+    CreatePaymentIntentRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - merchant_reference
+        - amount_minor
+        - currency
+        - payment_method_token
+        - capture_method
+      properties:
+        merchant_reference:
+          type: string
+          minLength: 1
+          maxLength: 128
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Integer amount in the currency's minor unit. Floating-point amounts are forbidden.
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        payment_method_token:
+          type: string
+          minLength: 1
+          maxLength: 512
+          description: Token or vault reference only. Raw PAN and CVV are forbidden.
+        capture_method:
+          type: string
+          const: automatic
+    PaymentIntent:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - object
+        - merchant_reference
+        - amount_minor
+        - currency
+        - payment_method_type
+        - capture_method
+        - status
+        - integrity_status
+        - authorized_amount_minor
+        - captured_amount_minor
+        - refunded_amount_minor
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          pattern: "^pi_[a-f0-9]{32}$"
+        object:
+          type: string
+          const: payment_intent
+        merchant_reference:
+          type: string
+        amount_minor:
+          type: integer
+          format: int64
+        currency:
+          type: string
+          pattern: "^[A-Z]{3}$"
+        payment_method_type:
+          type: string
+          const: card
+        capture_method:
+          type: string
+          const: automatic
+        status:
+          type: string
+          enum: [requires_confirmation, processing, requires_action, succeeded, failed, canceled]
+        integrity_status:
+          $ref: "#/components/schemas/IntegrityStatus"
+        authorized_amount_minor:
+          type: integer
+          format: int64
+          minimum: 0
+        captured_amount_minor:
+          type: integer
+          format: int64
+          minimum: 0
+        refunded_amount_minor:
+          type: integer
+          format: int64
+          minimum: 0
+        latest_attempt_id:
+          type: string
+          pattern: "^att_[a-f0-9]{32}$"
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    IntegrityStatus:
+      type: string
+      enum: [healthy, review_required]
+    ProviderOutcome:
+      type: object
+      additionalProperties: false
+      required:
+        - event_id
+        - operation_id
+        - provider
+        - status
+        - side_effect_certainty
+      properties:
+        event_id:
+          type: string
+          minLength: 1
+        operation_id:
+          type: string
+          pattern: "^op_[a-f0-9]{32}$"
+        attempt_id:
+          type: string
+          pattern: "^att_[a-f0-9]{32}$"
+        provider:
+          type: string
+          minLength: 1
+        provider_idempotency_key:
+          type: string
+          description: Optional on webhook delivery; when present it must equal operation_id in the first release.
+        status:
+          type: string
+          enum: [created, sending, unknown, succeeded, failed, review_required]
+        side_effect_certainty:
+          type: string
+          enum: [none, possible, confirmed]
+        provider_reference:
+          type: string
+        failure_code:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+    ErrorEnvelope:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
