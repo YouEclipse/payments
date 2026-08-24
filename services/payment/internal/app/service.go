@@ -256,7 +256,7 @@ func (s *Service) GetIntent(ctx context.Context, merchantID, intentID string) (R
 	if err != nil {
 		return Result{}, err
 	}
-	return resultForIntent(intent, false)
+	return resultForRetrievedIntent(intent)
 }
 
 func (s *Service) ReceiveProviderOutcome(ctx context.Context, outcome domain.ProviderOutcome, sanitizedPayload []byte) (Result, bool, error) {
@@ -375,6 +375,18 @@ func resultForIntent(intent domain.PaymentIntent, replay bool) (Result, error) {
 		status = http.StatusAccepted
 	}
 	return Result{Status: status, Body: body, Intent: view, Replay: replay}, nil
+}
+
+func resultForRetrievedIntent(intent domain.PaymentIntent) (Result, error) {
+	result, err := resultForIntent(intent, false)
+	if err != nil {
+		return Result{}, err
+	}
+	// GET reports the current representation successfully even while the
+	// underlying payment is still processing. HTTP 202 is reserved for an
+	// accepted mutation such as confirm.
+	result.Status = http.StatusOK
+	return result, nil
 }
 
 func viewOf(intent domain.PaymentIntent) PaymentIntentView {
