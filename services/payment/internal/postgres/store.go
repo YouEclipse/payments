@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -596,11 +598,21 @@ func completeIdempotencyForAggregateTx(ctx context.Context, tx pgx.Tx, aggregate
 }
 
 func lockProviderReferenceTx(ctx context.Context, tx pgx.Tx, provider, providerReference string) error {
-	lockKey := provider + "\x00" + providerReference
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, lockKey); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, providerReferenceLockID(provider, providerReference)); err != nil {
 		return fmt.Errorf("lock provider payment reference: %w", err)
 	}
 	return nil
+}
+
+func providerReferenceLockID(provider, providerReference string) int64 {
+	material := make([]byte, 16+len(provider)+len(providerReference))
+	binary.BigEndian.PutUint64(material[0:8], uint64(len(provider)))
+	copy(material[8:8+len(provider)], provider)
+	referenceOffset := 8 + len(provider)
+	binary.BigEndian.PutUint64(material[referenceOffset:referenceOffset+8], uint64(len(providerReference)))
+	copy(material[referenceOffset+8:], providerReference)
+	digest := sha256.Sum256(material)
+	return int64(binary.BigEndian.Uint64(digest[:8]))
 }
 
 func providerReferenceOwnerTx(ctx context.Context, tx pgx.Tx, provider, providerReference string) (string, error) {

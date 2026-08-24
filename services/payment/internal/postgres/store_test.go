@@ -62,3 +62,13 @@ func TestScanIdempotencyMissing(t *testing.T) {
 		t.Fatalf("unexpected missing lookup: %+v err=%v", lookup, err)
 	}
 }
+
+func TestProviderReferenceLockIDUsesAnUnambiguousPairEncoding(t *testing.T) {
+	first := providerReferenceLockID("provider-a", "reference-b")
+	if first != providerReferenceLockID("provider-a", "reference-b") {
+		t.Fatal("the same provider/reference pair must produce a stable lock ID")
+	}
+	if first == providerReferenceLockID("provider", "-areference-b") {
+		t.Fatal("different provider/reference pairs must not collapse through string concatenation")
+	}
+}
