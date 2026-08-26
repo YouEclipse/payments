@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+
+	"github.com/YouEclipse/payments/services/payment/internal/routingcontext"
 )
 
 var (
@@ -37,21 +39,47 @@ func NewRouterClient(baseURL, internalToken string, client *http.Client) (*Route
 }
 
 type RoutingRequest struct {
-	PaymentID     string `json:"payment_id"`
-	AttemptID     string `json:"attempt_id"`
-	MerchantID    string `json:"merchant_id"`
-	AmountMinor   int64  `json:"amount_minor"`
-	Currency      string `json:"currency"`
-	PaymentMethod string `json:"payment_method"`
-	Operation     string `json:"operation"`
+	// Context selects the explicit v2 contract. Nil is the retained legacy v1
+	// reader-first path, never an automatic fallback after a v2 error.
+	Context       *routingcontext.Context `json:"-"`
+	PaymentID     string                  `json:"payment_id"`
+	AttemptID     string                  `json:"attempt_id"`
+	MerchantID    string                  `json:"merchant_id"`
+	AmountMinor   int64                   `json:"amount_minor"`
+	Currency      string                  `json:"currency"`
+	PaymentMethod string                  `json:"payment_method"`
+	Operation     string                  `json:"operation"`
 }
 
 type RoutingDecision struct {
-	DecisionID        string               `json:"decision_id"`
-	SelectedCandidate RouteCandidate       `json:"selected_candidate"`
-	CandidateOrder    []string             `json:"candidate_order"`
-	Exclusions        []CandidateExclusion `json:"exclusions"`
-	PolicyVersion     string               `json:"policy_version"`
+	DecisionID               string                `json:"decision_id"`
+	SelectedCandidate        RouteCandidate        `json:"selected_candidate"`
+	CandidateOrder           []string              `json:"candidate_order"`
+	Exclusions               []CandidateExclusion  `json:"exclusions"`
+	PolicyVersion            string                `json:"policy_version"`
+	ContextSchemaVersion     string                `json:"context_schema_version,omitempty"`
+	ContextDigest            string                `json:"context_digest,omitempty"`
+	RuleSetVersion           string                `json:"rule_set_version,omitempty"`
+	RuleSetDigest            string                `json:"rule_set_digest,omitempty"`
+	CapabilityCatalogVersion string                `json:"capability_catalog_version,omitempty"`
+	CapabilityCatalogDigest  string                `json:"capability_catalog_digest,omitempty"`
+	RuleHits                 []RuleHit             `json:"rule_hits,omitempty"`
+	Eligibility              []EligibilityEvidence `json:"eligibility,omitempty"`
+	ReasonCodes              []string              `json:"reason_codes,omitempty"`
+}
+
+type RuleHit struct {
+	RuleID       string   `json:"rule_id"`
+	Truth        string   `json:"truth"`
+	Action       string   `json:"action"`
+	ReasonCode   string   `json:"reason_code"`
+	CandidateIDs []string `json:"candidate_ids"`
+}
+
+type EligibilityEvidence struct {
+	CandidateID string            `json:"candidate_id"`
+	Status      string            `json:"status"`
+	Reasons     []ExclusionReason `json:"reasons"`
 }
 
 type RouteCandidate struct {
@@ -76,11 +104,23 @@ type ExclusionReason struct {
 }
 
 func (c *RouterClient) Decide(ctx context.Context, routingRequest RoutingRequest) (RoutingDecision, error) {
-	body, err := json.Marshal(routingRequest)
+	var requestBody any = routingRequest
+	path := "/internal/v1/routing-decisions"
+	expectedDigest := ""
+	if routingRequest.Context != nil {
+		var err error
+		expectedDigest, err = routingRequest.Context.Digest()
+		if err != nil {
+			return RoutingDecision{}, fmt.Errorf("%w: invalid routing context", ErrUpstream)
+		}
+		requestBody = routingRequest.Context
+		path = "/internal/v2/routing-decisions"
+	}
+	body, err := json.Marshal(requestBody)
 	if err != nil {
 		return RoutingDecision{}, fmt.Errorf("marshal routing request: %w", err)
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/internal/v1/routing-decisions", bytes.NewReader(body))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(body))
 	if err != nil {
 		return RoutingDecision{}, fmt.Errorf("build routing request: %w", err)
 	}
@@ -93,15 +133,28 @@ func (c *RouterClient) Decide(ctx context.Context, routingRequest RoutingRequest
 		return RoutingDecision{}, fmt.Errorf("%w: router transport: %v", ErrUpstream, err)
 	}
 	defer response.Body.Close()
-	payload, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	payload, err := io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
 	if err != nil {
 		return RoutingDecision{}, fmt.Errorf("%w: read router response: %v", ErrUpstream, err)
+	}
+	if len(payload) > 1<<20 {
+		return RoutingDecision{}, fmt.Errorf("%w: router response exceeds size limit", ErrUpstream)
 	}
 	var decision RoutingDecision
 	if err := json.Unmarshal(payload, &decision); err != nil {
 		return RoutingDecision{}, fmt.Errorf("%w: decode router response: %v", ErrUpstream, err)
 	}
+	if expectedDigest != "" && (response.StatusCode == http.StatusOK || response.StatusCode == http.StatusUnprocessableEntity) {
+		if decision.ContextSchemaVersion != routingcontext.SchemaVersion || decision.ContextDigest != expectedDigest ||
+			decision.DecisionID == "" || decision.RuleSetVersion == "" || decision.PolicyVersion != decision.RuleSetVersion ||
+			!validArtifactDigest(decision.RuleSetDigest) || decision.CapabilityCatalogVersion == "" || !validArtifactDigest(decision.CapabilityCatalogDigest) {
+			return RoutingDecision{}, fmt.Errorf("%w: router context or artifact evidence mismatch", ErrUpstream)
+		}
+	}
 	if response.StatusCode == http.StatusUnprocessableEntity {
+		if expectedDigest != "" && (decision.SelectedCandidate != (RouteCandidate{}) || len(decision.CandidateOrder) != 0) {
+			return RoutingDecision{}, fmt.Errorf("%w: rejected routing decision has a candidate", ErrUpstream)
+		}
 		return decision, ErrNoEligibleProvider
 	}
 	if response.StatusCode != http.StatusOK {
@@ -116,7 +169,36 @@ func (c *RouterClient) Decide(ctx context.Context, routingRequest RoutingRequest
 	if len(decision.CandidateOrder) == 0 || decision.CandidateOrder[0] != selected.CandidateID {
 		return RoutingDecision{}, fmt.Errorf("%w: router selected candidate does not match candidate order", ErrUpstream)
 	}
+	seen := make(map[string]bool, len(decision.CandidateOrder))
+	eligible := make(map[string]bool, len(decision.Eligibility))
+	if expectedDigest != "" {
+		for _, evidence := range decision.Eligibility {
+			if _, duplicate := eligible[evidence.CandidateID]; duplicate || !validPlatformIdentifier(evidence.CandidateID) ||
+				(evidence.Status != "eligible" && evidence.Status != "ineligible" && evidence.Status != "unknown") {
+				return RoutingDecision{}, fmt.Errorf("%w: router eligibility evidence is invalid", ErrUpstream)
+			}
+			eligible[evidence.CandidateID] = evidence.Status == "eligible"
+		}
+	}
+	for _, candidate := range decision.CandidateOrder {
+		if !validPlatformIdentifier(candidate) || seen[candidate] || (expectedDigest != "" && !eligible[candidate]) {
+			return RoutingDecision{}, fmt.Errorf("%w: router candidate order is invalid", ErrUpstream)
+		}
+		seen[candidate] = true
+	}
 	return decision, nil
+}
+
+func validArtifactDigest(value string) bool {
+	if !strings.HasPrefix(value, "sha256:") || len(value) != 71 {
+		return false
+	}
+	for _, character := range value[7:] {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func validPlatformIdentifier(value string) bool {

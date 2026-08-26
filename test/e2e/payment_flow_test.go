@@ -59,6 +59,40 @@ func TestPaymentVerticalSlice(t *testing.T) {
 		if replayedConfirmResponse.Header.Get("Idempotent-Replayed") != "true" || replayedConfirmation.ID != intent.ID || replayedConfirmation.Status != "succeeded" {
 			t.Fatalf("confirm replay was not stable: intent=%+v header=%q", replayedConfirmation, replayedConfirmResponse.Header.Get("Idempotent-Replayed"))
 		}
+		assertSingleFundsPath(t, intent.ID, "simulator_a_us_primary")
+		assertRoutingEvidence(t, intent.ID, "USD", "simulator_a_us_primary")
+	})
+
+	t.Run("EUR selects another connection of the same PSP", func(t *testing.T) {
+		suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+		intent, response := createIntent(t, baseURL, apiKey, "create-eur-"+suffix, "order-eur-"+suffix, "EUR", "pm_sim_approved")
+		response.Body.Close()
+		confirmed, confirmResponse := confirmIntent(t, baseURL, apiKey, intent.ID, "confirm-eur-"+suffix)
+		confirmResponse.Body.Close()
+		if confirmResponse.StatusCode != http.StatusOK || confirmed.Status != "succeeded" {
+			t.Fatalf("EUR confirm status=%d intent=%+v", confirmResponse.StatusCode, confirmed)
+		}
+		assertSingleFundsPath(t, intent.ID, "simulator_a_eu_backup")
+		assertRoutingEvidence(t, intent.ID, "EUR", "simulator_a_eu_backup")
+	})
+
+	t.Run("no eligible candidate creates no funds path", func(t *testing.T) {
+		suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+		intent, response := createIntent(t, baseURL, apiKey, "create-gbp-"+suffix, "order-gbp-"+suffix, "GBP", "pm_sim_approved")
+		response.Body.Close()
+		_, confirmResponse := confirmIntent(t, baseURL, apiKey, intent.ID, "confirm-gbp-"+suffix)
+		confirmResponse.Body.Close()
+		if confirmResponse.StatusCode != http.StatusUnprocessableEntity {
+			t.Fatalf("unsupported currency reached dispatch: HTTP %d", confirmResponse.StatusCode)
+		}
+		if current := getIntent(t, baseURL, apiKey, intent.ID); current.Status != "requires_confirmation" {
+			t.Fatalf("rejected routing changed payment: %+v", current)
+		}
+		pool, ctx := e2eDatabase(t)
+		var attempts, operations int
+		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM payment_attempts WHERE payment_intent_id=$1), (SELECT count(*) FROM provider_operations WHERE payment_intent_id=$1)`, intent.ID).Scan(&attempts, &operations); err != nil || attempts != 0 || operations != 0 {
+			t.Fatalf("no-eligible created funds path: attempts=%d operations=%d err=%v", attempts, operations, err)
+		}
 	})
 
 	t.Run("decline is conclusive and does not fallback", func(t *testing.T) {
@@ -85,23 +119,30 @@ func TestPaymentVerticalSlice(t *testing.T) {
 		if final.Status != "succeeded" || final.IntegrityStatus != "healthy" {
 			t.Fatalf("unknown payment did not converge safely: %+v", final)
 		}
-		assertSingleFundsPath(t, intent.ID)
+		assertSingleFundsPath(t, intent.ID, "simulator_a_us_primary")
+		assertRoutingEvidence(t, intent.ID, "USD", "simulator_a_us_primary")
 	})
 }
 
-func assertSingleFundsPath(t *testing.T, paymentIntentID string) {
+func e2eDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 	t.Helper()
 	databaseURL := env("E2E_DATABASE_URL", "postgres://payments:payments-local-only@127.0.0.1:5432/payments?sslmode=disable")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 	pool, err := pgxpool.New(ctx, databaseURL)
 	if err != nil {
 		t.Fatalf("open E2E database: %v", err)
 	}
-	defer pool.Close()
+	t.Cleanup(pool.Close)
+	return pool, ctx
+}
+
+func assertSingleFundsPath(t *testing.T, paymentIntentID, wantConnection string) {
+	t.Helper()
+	pool, ctx := e2eDatabase(t)
 
 	var attempts, paymentOperations, gatewayOperations int
-	err = pool.QueryRow(ctx, `
+	err := pool.QueryRow(ctx, `
 		SELECT
 			(SELECT count(*) FROM payment_attempts WHERE payment_intent_id=$1),
 			(SELECT count(*) FROM provider_operations WHERE payment_intent_id=$1),
@@ -133,10 +174,62 @@ func assertSingleFundsPath(t *testing.T, paymentIntentID string) {
 	).Scan(&paymentConnectionID, &paymentRevision, &paymentNamespace, &gatewayConnectionID, &gatewayRevision, &gatewayNamespace); err != nil {
 		t.Fatalf("read pinned provider connection: %v", err)
 	}
-	if paymentConnectionID != "simulator_a_us_primary" || paymentRevision != "simulator_a_us_primary_v1" || paymentNamespace != "simulator_a" ||
+	if paymentConnectionID != wantConnection || paymentRevision != wantConnection+"_v1" || paymentNamespace != "simulator_a" ||
 		gatewayConnectionID != paymentConnectionID || gatewayRevision != paymentRevision || gatewayNamespace != paymentNamespace {
 		t.Fatalf("UNKNOWN recovery drifted execution identity: payment=(%q,%q,%q) gateway=(%q,%q,%q)",
 			paymentConnectionID, paymentRevision, paymentNamespace, gatewayConnectionID, gatewayRevision, gatewayNamespace)
+	}
+}
+
+func assertRoutingEvidence(t *testing.T, paymentIntentID, wantCurrency, wantConnection string) {
+	t.Helper()
+	pool, ctx := e2eDatabase(t)
+	var attemptID, decisionID, contextJSON, decisionJSON string
+	if err := pool.QueryRow(ctx, `SELECT id,routing_decision_id,routing_context_snapshot::text,routing_decision_snapshot::text FROM payment_attempts WHERE payment_intent_id=$1`, paymentIntentID).Scan(&attemptID, &decisionID, &contextJSON, &decisionJSON); err != nil {
+		t.Fatalf("v2 decision was not frozen with the Attempt: %v", err)
+	}
+	var snapshot struct {
+		Schema string `json:"context_schema_version"`
+		Base   struct {
+			PaymentID   string `json:"payment_id"`
+			AttemptID   string `json:"attempt_id"`
+			MerchantID  string `json:"merchant_id"`
+			Currency    string `json:"currency"`
+			AmountMinor int64  `json:"amount_minor"`
+			Operation   string `json:"operation"`
+		} `json:"base"`
+	}
+	var decision struct {
+		ID             string `json:"decision_id"`
+		Schema         string `json:"context_schema_version"`
+		Digest         string `json:"context_digest"`
+		PolicyVersion  string `json:"policy_version"`
+		RuleSetVersion string `json:"rule_set_version"`
+		RuleSetDigest  string `json:"rule_set_digest"`
+		CatalogDigest  string `json:"capability_catalog_digest"`
+		Selected       struct {
+			ID string `json:"candidate_id"`
+		} `json:"selected_candidate"`
+		Eligibility []struct {
+			ID string `json:"candidate_id"`
+		} `json:"eligibility"`
+	}
+	if err := json.Unmarshal([]byte(contextJSON), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(decisionJSON), &decision); err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Schema != "routing_context.v1" || snapshot.Base.PaymentID != paymentIntentID || snapshot.Base.AttemptID != attemptID || snapshot.Base.MerchantID != "merchant_demo" || snapshot.Base.Currency != wantCurrency || snapshot.Base.AmountMinor != 5200 || snapshot.Base.Operation != "sale" {
+		t.Fatalf("stored Context does not bind the paid Intent/Attempt: %+v", snapshot)
+	}
+	if decision.ID != decisionID || decision.Schema != snapshot.Schema || len(decision.Digest) != 71 || decision.PolicyVersion == "" || decision.PolicyVersion != decision.RuleSetVersion || len(decision.RuleSetDigest) != 71 || len(decision.CatalogDigest) != 71 || decision.Selected.ID != wantConnection || len(decision.Eligibility) != 2 {
+		t.Fatalf("incomplete or mismatched routing evidence: %+v", decision)
+	}
+	for _, forbidden := range []string{"payment_method_token", "pm_sim_approved", "pm_sim_timeout", `"pan"`, `"cvv"`, `"secret"`} {
+		if strings.Contains(strings.ToLower(contextJSON+decisionJSON), forbidden) {
+			t.Fatalf("forbidden credential data in routing evidence: %s", forbidden)
+		}
 	}
 }
 

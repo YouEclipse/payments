@@ -1,11 +1,12 @@
 openapi: 3.1.0
 info:
   title: Payment Router Internal API
-  version: 0.2.0
+  version: 0.3.0
   description: |
-    Internal contract for deterministic provider eligibility and static routing.
-    The Router owns provider capabilities and the active policy. Callers send
-    only non-sensitive routing context; credentials and tokens are forbidden.
+    Reader-first internal contract. v1 retains the explicit legacy static
+    interface. v2 accepts a strict versioned credential-free Context and uses
+    Router-owned immutable RuleSet and CapabilityCatalog snapshots. No endpoint
+    accepts caller-supplied policy, capabilities, credentials or payment tokens.
 servers:
   - url: http://router:8081
 paths:
@@ -50,7 +51,7 @@ paths:
   /internal/v1/routing-decisions:
     post:
       operationId: createRoutingDecision
-      summary: Select an eligible provider connection using a versioned static policy
+      summary: Legacy static selection of an eligible provider connection
       description: |
         Applies Router-owned hard eligibility constraints before Router-owned
         static candidate ordering. Every candidate is one exact provider,
@@ -107,6 +108,75 @@ paths:
                 $ref: "#/components/schemas/NoEligibleProviderResponse"
         "500":
           $ref: "#/components/responses/ErrorResponse"
+  /internal/v2/routing-decisions:
+    post:
+      operationId: createVersionedRoutingDecision
+      summary: Evaluate a frozen Context against Router-owned rules and capabilities
+      description: |
+        This explicit v2 endpoint never falls back to v1. Router first evaluates
+        enabled/currency/named-country/method/operation/capture/credential-domain
+        support and effective freshness using three-valued eligibility. Only
+        eligible candidates reach deterministic prefer/exclude/force/split rules.
+        Rule actions cannot restore ineligible or unknown candidates. The exact
+        candidate connection/revision/namespace/account tuple is returned intact.
+
+        The Context body is direct, not wrapped. Duplicate keys, case aliases,
+        unknown fields, JSON null, trailing objects and unbounded/deep input are
+        rejected. The body limit is 1 MiB, the token budget is 20000 and nesting
+        is limited to 24. Timestamps are canonical UTC RFC3339Nano strings; known
+        observations must still be fresh at admission and completion. built_at
+        cannot be future-dated or more than five minutes old. Observed timestamps
+        cannot follow built_at. Decisions evaluate at built_at without I/O, wall
+        clocks, randomness, health, cost or ML inputs. Expired Router artifacts
+        cannot be extended by replaying an earlier Context.
+
+        The canonical Context digest is SHA-256 of compact Go JSON in the schema
+        field order: context_schema_version,built_at,base,merchant,
+        payment_method_context. The shared routing-context-v1.json fixture freezes
+        nested field order and omission rules across Payment and Router.
+      security:
+        - InternalServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoutingContextV1"
+      responses:
+        "200":
+          description: An exact eligible connection with immutable decision evidence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutingDecisionV2"
+        "400":
+          description: Context is malformed, unsupported, inconsistent or outside its online freshness window. Errors never echo input values or unknown keys.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "405":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "415":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          description: No candidate remains eligible under capability and hard policy constraints. No winner is present; candidate_order is empty. Preserve the negative decision evidence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoEligibleProviderResponseV2"
+        "503":
+          description: routing_v2_unavailable when no v2 snapshots are installed; routing_snapshot_unavailable when the active snapshots or chosen descriptor have expired. Never retry through v1.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "500":
+          $ref: "#/components/responses/ErrorResponse"
 components:
   securitySchemes:
     InternalServiceToken:
@@ -122,6 +192,311 @@ components:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
   schemas:
+    ContextIdentifier:
+      type: string
+      pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+      description: Bounded non-secret identifier. Connection IDs retain their independent lowercase contract.
+
+    CanonicalInstant:
+      type: string
+      format: date-time
+      pattern: '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{0,8}[1-9])?Z$'
+      description: Nonzero canonical UTC RFC3339Nano instant. Numeric offsets and trailing zero fractional digits are not canonical.
+
+    Observed:
+      type: object
+      additionalProperties: false
+      required: [state, source, source_version, observed_at]
+      properties:
+        state:
+          type: string
+          enum: [known, unknown, not_applicable, redacted, stale]
+        value:
+          $ref: "#/components/schemas/ContextIdentifier"
+        source:
+          $ref: "#/components/schemas/ContextIdentifier"
+        source_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        observed_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        expires_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+      allOf:
+        - if:
+            properties:
+              state:
+                enum: [known, stale]
+          then:
+            required: [value, expires_at]
+            properties:
+              value:
+                $ref: "#/components/schemas/ContextIdentifier"
+              expires_at:
+                $ref: "#/components/schemas/CanonicalInstant"
+          else:
+            not:
+              required: [value]
+              properties:
+                value: {}
+      description: |
+        Wire order is state,value,source,source_version,observed_at,expires_at.
+        Omitted optional fields are not null. Known and stale require a value
+        and an expiry later than observed_at. Known expires after built_at;
+        stale expires at or before built_at. Unknown/not_applicable/redacted
+        prohibit value, never default to known, and never supply rule facts.
+        All observations are timestamped at or before built_at. Optional expiry
+        for a non-value state must still be later than observed_at.
+
+    RoutingContextV1:
+      type: object
+      additionalProperties: false
+      required: [context_schema_version, built_at, base, merchant, payment_method_context]
+      properties:
+        context_schema_version:
+          type: string
+          const: routing_context.v1
+        built_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        base:
+          $ref: "#/components/schemas/ContextBase"
+        merchant:
+          type: object
+          additionalProperties: false
+          required: [entity_id, country]
+          properties:
+            entity_id:
+              $ref: "#/components/schemas/ContextIdentifier"
+            country:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    state:
+                      const: known
+                    value:
+                      type: string
+                      pattern: '^[A-Z]{2}$'
+              description: Explicit known merchant-profile country; never inferred from card, currency or provider region.
+        payment_method_context:
+          type: object
+          additionalProperties: false
+          required: [category, network, issuer_country, credential_domain]
+          properties:
+            category:
+              type: string
+              const: card
+              description: Must equal base.payment_method; never a credential.
+            network:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    value:
+                      type: string
+                      enum: [visa, mastercard, amex, discover, jcb, unionpay, diners]
+            issuer_country:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    value:
+                      type: string
+                      pattern: '^[A-Z]{2}$'
+            credential_domain:
+              $ref: "#/components/schemas/Observed"
+              description: Non-secret compatibility domain supplied by a trusted metadata owner. A token string, token prefix or PSP brand is not evidence of portability. Unknown/stale closes capability eligibility.
+
+    ContextBase:
+      type: object
+      additionalProperties: false
+      required: [payment_id, attempt_id, merchant_id, amount_minor, currency, payment_method, operation, capture_method]
+      properties:
+        payment_id:
+          $ref: "#/components/schemas/ContextIdentifier"
+        attempt_id:
+          $ref: "#/components/schemas/ContextIdentifier"
+        merchant_id:
+          $ref: "#/components/schemas/ContextIdentifier"
+        amount_minor:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 9223372036854775807
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          description: Syntax validation only; actual supported currencies come from the versioned capability catalog.
+        payment_method:
+          type: string
+          const: card
+        operation:
+          type: string
+          enum: [sale, authorize]
+        capture_method:
+          type: string
+          enum: [automatic, manual]
+      oneOf:
+        - properties:
+            operation:
+              const: sale
+            capture_method:
+              const: automatic
+        - properties:
+            operation:
+              const: authorize
+            capture_method:
+              const: manual
+      description: Payment currently emits sale/automatic. Router also represents initial authorize/manual, not a follow-on capture/void/refund route and not proof that Payment implements authorization lifecycles.
+
+    ArtifactDigest:
+      type: string
+      pattern: '^sha256:[a-f0-9]{64}$'
+
+    RoutingEvidenceV2:
+      type: object
+      required: [decision_id, candidate_order, exclusions, policy_version, context_schema_version, context_digest, rule_set_version, rule_set_digest, capability_catalog_version, capability_catalog_digest, rule_hits, eligibility, reason_codes]
+      properties:
+        decision_id:
+          type: string
+          pattern: '^rtd_[a-f0-9]{32}$'
+        candidate_order:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+          description: Only eligible exact IDs; order is evidence, never authority to retry an UNKNOWN operation or switch connections.
+        exclusions:
+          type: array
+          items:
+            $ref: "#/components/schemas/CandidateExclusionV2"
+        policy_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+          description: Compatibility field exactly equal to rule_set_version.
+        context_schema_version:
+          type: string
+          const: routing_context.v1
+        context_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        rule_set_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        rule_set_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        capability_catalog_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        capability_catalog_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        rule_hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleHit"
+          description: Trace for every compiled rule, including false and unknown conditions, in descending priority then rule-ID order.
+        eligibility:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/EligibilityEvidence"
+        reason_codes:
+          type: array
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+
+    RoutingDecisionV2:
+      type: object
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/RoutingEvidenceV2"
+        - required: [selected_candidate]
+          properties:
+            selected_candidate:
+              $ref: "#/components/schemas/RouteCandidate"
+            candidate_order:
+              type: array
+              minItems: 1
+              items:
+                type: string
+      description: selected_candidate must equal candidate_order[0] and its eligibility status must be eligible.
+
+    NoEligibleProviderResponseV2:
+      type: object
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/RoutingEvidenceV2"
+        - required: [error]
+          properties:
+            error:
+              allOf:
+                - $ref: "#/components/schemas/APIError"
+                - properties:
+                    code:
+                      const: no_eligible_provider
+            candidate_order:
+              type: array
+              maxItems: 0
+              items:
+                type: string
+
+    RoutingReasonV2:
+      type: object
+      additionalProperties: false
+      required: [code, detail]
+      properties:
+        code:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+          description: Stable capability or Router-authored policy reason; never a token or untrusted request value.
+        detail:
+          type: string
+
+    CandidateExclusionV2:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, provider, reasons]
+      properties:
+        candidate_id:
+          type: string
+        provider:
+          type: string
+        reasons:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RoutingReasonV2"
+
+    EligibilityEvidence:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, status, reasons]
+      properties:
+        candidate_id:
+          type: string
+        status:
+          type: string
+          enum: [eligible, ineligible, unknown]
+        reasons:
+          type: array
+          items:
+            $ref: "#/components/schemas/RoutingReasonV2"
+      description: A known no dominates unknown; only all-known-positive fresh constraints yield eligible. Expired descriptor facts are unknown, not known current yes or no.
+
+    RuleHit:
+      type: object
+      additionalProperties: false
+      required: [rule_id, truth, action, reason_code, candidate_ids]
+      properties:
+        rule_id:
+          type: string
+        truth:
+          type: string
+          enum: ['true', 'false', unknown]
+        action:
+          type: string
+          enum: [prefer, exclude, force, split]
+        reason_code:
+          type: string
+        candidate_ids:
+          type: array
+          items:
+            type: string
+
     HealthResponse:
       type: object
       additionalProperties: false

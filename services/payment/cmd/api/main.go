@@ -15,6 +15,7 @@ import (
 	"github.com/YouEclipse/payments/services/payment/internal/config"
 	"github.com/YouEclipse/payments/services/payment/internal/httpapi"
 	paymentpostgres "github.com/YouEclipse/payments/services/payment/internal/postgres"
+	"github.com/YouEclipse/payments/services/payment/internal/routingcontext"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -75,7 +76,19 @@ func run(logger *slog.Logger) error {
 		return err
 	}
 	store := paymentpostgres.NewStore(pool)
-	service := app.NewService(store, router, gateway, logger, settings.UpstreamTimeout)
+	var serviceOptions []app.Option
+	if settings.RouterAPIVersion == "v2" {
+		var metadata routingcontext.MetadataSource = routingcontext.UnavailableMetadata{}
+		if routingcontext.IsLocalEnvironment(settings.Environment) {
+			metadata = routingcontext.SimulatorMetadata{}
+		}
+		builder, err := routingcontext.NewBuilder(settings.MerchantProfiles, metadata)
+		if err != nil {
+			return err
+		}
+		serviceOptions = append(serviceOptions, app.WithRoutingContext(builder))
+	}
+	service := app.NewService(store, router, gateway, logger, settings.UpstreamTimeout, serviceOptions...)
 	authenticator := httpapi.NewAuthenticator(settings.MerchantAPIKeys, settings.InternalToken)
 	handler := httpapi.NewHandler(service, store, authenticator, logger)
 

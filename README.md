@@ -84,6 +84,14 @@ curl --request POST http://localhost:8080/v1/payment_intents/<PAYMENT_INTENT_ID>
 
 `pm_sim_approved` 会同步成功，`pm_sim_declined` 会得到明确拒绝，`pm_sim_timeout_then_succeeded` 会先返回 `processing`，随后由原 operation 的查询或 webhook 收敛为 `succeeded`。最后一种场景不会创建新的 Payment Attempt，也不会切到另一家 provider。
 
+### 版本化 Context、规则与通道能力
+
+默认 Payment 使用 Router v2：从 Intent、显式商户 profile 与受控 metadata 构建无凭证的 Context，Router 先做三值 Capability 过滤，再执行版本化规则。Response 同时给出 Context/RuleSet/Catalog 摘要、匹配轨迹与排除原因；Payment 在 dispatch 前把 Context 和 Decision 随 Attempt 一起写入不可变快照。
+
+本地 USD/BRL 选 `simulator_a_us_primary`，EUR 选 `simulator_a_eu_backup`；GBP 没有 eligible candidate，Confirm 返回 422 且不创建资金操作。两个连接仍属于模拟 Provider，不是真实账户。可把上例的 `currency` 改为 EUR 验证第二条连接。
+
+`PAYMENT_ROUTER_API_VERSION=v1` 是显式兼容模式，不是 v2 错误时的自动 fallback。自定义商户需要 `PAYMENT_MERCHANT_PROFILES_JSON`；自定义规则/能力用 Router 所有的 `ROUTER_V2_CONFIG_JSON`。单个 `merchant_demo` 的本地 profile 仅在启动后 24 小时内有效；非本地不会猜测商户归属或 token 兼容性。协议、配置和 reader-first 升级顺序见 [ADR 0003](docs/adr/0003-versioned-routing-context.md)。
+
 ## 常用命令
 
 ```bash
@@ -103,6 +111,8 @@ make ci
 
 - [系统架构](docs/architecture.md)
 - [ADR 0001：服务边界](docs/adr/0001-service-boundaries.md)
+- [ADR 0002：不可变 Provider Connection](docs/adr/0002-immutable-provider-connections.md)
+- [ADR 0003：冻结 Context 与 Router v2](docs/adr/0003-versioned-routing-context.md)
 - API 契约位于 `contracts/`。
 
 ## 关键语义依据
@@ -117,6 +127,6 @@ make ci
 
 当前纵向切片只支持一次性 tokenized card 与 `capture_method=automatic`，其初始资金操作是单个 `SALE`。手动 Capture、Void、Refund、3DS、真实 PSP connector、账务台账与清结算会随本书后续章节逐步加入。
 
-CI 会用真实 PostgreSQL 启动四个容器，覆盖同步成功、明确拒绝、响应丢失后安全收敛、商户幂等，以及 UNKNOWN 场景只有一条 Attempt/Provider Operation 资金路径。Router 的本地配置包含同一 simulator provider 的两个独立 connection，用于证明恢复不会漂移到备用账户或区域；外部 provider 仍然只是 simulator。
+CI 会用真实 PostgreSQL 启动四个容器，覆盖同步成功、明确拒绝、响应丢失后安全收敛、商户幂等，以及 UNKNOWN 场景只有一条 Attempt/Provider Operation 资金路径。v2 还检查 USD/EUR 的两个精确连接、冻结证据和 no-eligible 零资金路径；外部 provider 仍然只是 simulator。当前规则支持 typed eq/in/range/all 与 prefer/exclude/force/split，尚无动态成本/成功率/Risk Scoring、配置审批发布或独立 Decision Store。
 
 这个仓库是教学实现，也会尽量保留生产支付系统真正重要的语义。它不是经过 PCI DSS 认证的即用型支付产品；接入真实资金前仍需完成安全评审、合规认证、密钥管理、灾备和运营控制。

@@ -200,18 +200,21 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 		}
 		return PrepareConfirmationResult{}, err
 	}
+	if err := validateRoutingEvidence(attempt, intent); err != nil {
+		return PrepareConfirmationResult{}, err
+	}
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO payment_attempts (
 			id, payment_intent_id, attempt_number, routing_decision_id,
 			provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
 			status, outcome_code, reroute_disposition, provider_payment_reference,
-			version, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,$11,$12,$13)`,
+			version, created_at, updated_at, routing_context_snapshot, routing_decision_snapshot
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,$11,$12,$13,NULLIF($14,'')::jsonb,NULLIF($15,'')::jsonb)`,
 		attempt.ID, attempt.PaymentIntentID, attempt.AttemptNumber, attempt.RoutingDecisionID,
 		attempt.ProviderConnectionID, attempt.ProviderConnectionRevision, attempt.ProviderNamespaceID,
 		attempt.Provider, attempt.Status, attempt.RerouteDisposition, attempt.Version,
-		attempt.CreatedAt, attempt.UpdatedAt,
+		attempt.CreatedAt, attempt.UpdatedAt, attempt.RoutingContextSnapshot, attempt.RoutingDecisionSnapshot,
 	)
 	if err != nil {
 		return PrepareConfirmationResult{}, fmt.Errorf("insert payment attempt: %w", err)
@@ -923,7 +926,8 @@ func getAggregateByOperationTx(ctx context.Context, query queryer, operationID s
 		SELECT id,payment_intent_id,attempt_number,routing_decision_id,
 		       provider_connection_id,provider_connection_revision,provider_namespace_id,provider,status,
 		       COALESCE(outcome_code,''),reroute_disposition,
-		       COALESCE(provider_payment_reference,''),version,created_at,updated_at
+		       COALESCE(provider_payment_reference,''),version,created_at,updated_at,
+		       COALESCE(routing_context_snapshot::text,''),COALESCE(routing_decision_snapshot::text,'')
 		FROM payment_attempts WHERE id=$1`+suffix, operation.PaymentAttemptID)
 	attempt, err := scanAttempt(attemptRow)
 	if err != nil {
@@ -955,7 +959,7 @@ func scanAttempt(row rowScanner) (domain.PaymentAttempt, error) {
 		&attempt.RoutingDecisionID, &attempt.ProviderConnectionID, &attempt.ProviderConnectionRevision,
 		&attempt.ProviderNamespaceID, &attempt.Provider, &attempt.Status,
 		&attempt.OutcomeCode, &attempt.RerouteDisposition, &attempt.ProviderPaymentReference,
-		&attempt.Version, &attempt.CreatedAt, &attempt.UpdatedAt,
+		&attempt.Version, &attempt.CreatedAt, &attempt.UpdatedAt, &attempt.RoutingContextSnapshot, &attempt.RoutingDecisionSnapshot,
 	)
 	return attempt, err
 }

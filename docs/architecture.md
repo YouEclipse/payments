@@ -37,6 +37,7 @@ Payment 服务提供公共支付 API，并拥有支付生命周期及自己的 P
 - 为每个 Provider Operation 生成一次稳定 ID，并在同一 Provider connection 内复用为幂等键；
 - 接收并去重 gateway 归一化后的 provider outcome；
 - 将未知结果送入查询和 reconciliation，而不是立即换路重试。
+- 从权威 Intent、商户配置和受控 metadata source 构建版本化、无支付凭证的 Context，并在准备 Attempt 的事务中冻结 Context/Decision 证据。
 
 第一阶段的 durable worker 可以和 payment HTTP 进程位于同一部署单元。若吞吐或故障隔离需要独立扩缩，可将 worker 拆成新二进制，但数据库所有权仍属于 payment 边界。
 
@@ -45,6 +46,8 @@ Payment 服务提供公共支付 API，并拥有支付生命周期及自己的 P
 Router 接收已经规范化的 routing context，先执行币种、地区、支付方式和能力等硬约束，再根据明确策略给出排序后的候选 provider、选择结果和 reason codes。它不发起扣款、不写 payment 数据库，也不能把统计得分覆盖在资格约束之上。
 
 Router 候选项不是 PSP 品牌字符串，而是稳定 `candidate_id`：它同时标识 Provider、Merchant Account、Connector 与 Region，并返回 `connection_revision` 和 `provider_namespace_id`。Payment 将 ID 固定为 `provider_connection_id`，连同 revision、namespace 与 provider 持久化到 Attempt 和 Operation；Provider Gateway 只能执行这条精确连接。Provider 名称仍用于选择 adapter kind，但不能替代连接身份。Gateway 的不可变 revision registry 防止相同 ID/revision 被重新绑定到不同执行配置，详见 [ADR 0002](adr/0002-immutable-provider-connections.md)。
+
+默认在线路径为显式 v2：严格 Context admission → Capability 三值过滤 → 确定性规则 → 稳定候选顺序。RuleSet 与 Catalog 是 Router 拥有的独立不可变 artifact；force/split 不能把 ineligible/unknown 候选加回来。纯求值依赖冻结的 built_at，HTTP 入口另做当前时间与新鲜度检查。v1 仍为 reader-first 升级保留，Payment 不会在 v2 失败后静默调用 v1。[ADR 0003](adr/0003-versioned-routing-context.md)记录 wire golden、摘要规范、配置和持久化边界。
 
 ### Provider Gateway
 
@@ -85,7 +88,7 @@ sequenceDiagram
     P->>D: Insert intent / replay stored response
     P->>R: Request eligible route
     R-->>P: selected_candidate + reason codes
-    P->>D: Create attempt and durable work
+    P->>D: Create attempt + frozen Context/Decision + durable work
     P->>G: Execute SALE on fixed provider_connection_id
     G->>X: Provider-specific automatic-capture request
     alt Determinate response

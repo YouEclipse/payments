@@ -129,6 +129,8 @@ type PaymentAttempt struct {
 	PaymentIntentID            string
 	AttemptNumber              int
 	RoutingDecisionID          string
+	RoutingContextSnapshot     string
+	RoutingDecisionSnapshot    string
 	ProviderConnectionID       string
 	ProviderConnectionRevision string
 	ProviderNamespaceID        string

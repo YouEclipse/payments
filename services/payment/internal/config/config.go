@@ -6,6 +6,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/YouEclipse/payments/services/payment/internal/routingcontext"
 )
 
 type Config struct {
@@ -19,6 +21,8 @@ type Config struct {
 	UpstreamTimeout   time.Duration
 	ReconcileInterval time.Duration
 	ReconcileStaleAge time.Duration
+	RouterAPIVersion  string
+	MerchantProfiles  []routingcontext.MerchantProfile
 }
 
 func Load() (Config, error) {
@@ -33,6 +37,7 @@ func Load() (Config, error) {
 		UpstreamTimeout:   3 * time.Second,
 		ReconcileInterval: 2 * time.Second,
 		ReconcileStaleAge: 5 * time.Second,
+		RouterAPIVersion:  valueOrDefault("PAYMENT_ROUTER_API_VERSION", "v2"),
 	}
 	if config.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is required")
@@ -63,6 +68,35 @@ func Load() (Config, error) {
 	if config.InternalToken == "" {
 		return Config{}, errors.New("INTERNAL_SERVICE_TOKEN is required outside local/test")
 	}
+	if config.RouterAPIVersion != "v1" && config.RouterAPIVersion != "v2" {
+		return Config{}, errors.New("PAYMENT_ROUTER_API_VERSION must be v1 or v2")
+	}
+	if config.RouterAPIVersion == "v2" {
+		spec := os.Getenv("PAYMENT_MERCHANT_PROFILES_JSON")
+		if spec == "" && isLocal(environment) && len(config.MerchantAPIKeys) == 1 && config.MerchantAPIKeys["merchant_demo"] != "" {
+			now := time.Now().UTC()
+			config.MerchantProfiles = []routingcontext.MerchantProfile{{MerchantID: "merchant_demo", EntityID: "merchant_demo_us",
+				Country: "US", Version: "local_demo.v1", ObservedAt: now, ExpiresAt: now.Add(24 * time.Hour)}}
+		} else {
+			config.MerchantProfiles, err = routingcontext.DecodeProfiles(spec)
+			if err != nil {
+				return Config{}, errors.New("PAYMENT_MERCHANT_PROFILES_JSON must contain explicit valid merchant profiles for v2")
+			}
+		}
+		known := make(map[string]bool, len(config.MerchantProfiles))
+		now := time.Now().UTC()
+		for _, profile := range config.MerchantProfiles {
+			if profile.ObservedAt.After(now) || !now.Before(profile.ExpiresAt) {
+				return Config{}, errors.New("merchant profile is future-dated or expired")
+			}
+			known[profile.MerchantID] = true
+		}
+		for merchant := range config.MerchantAPIKeys {
+			if !known[merchant] {
+				return Config{}, errors.New("authenticated merchant has no routing profile")
+			}
+		}
+	}
 	return config, nil
 }
 
@@ -75,7 +109,7 @@ func parseMerchantKeys(spec string) (map[string]string, error) {
 	for _, item := range strings.Split(spec, ",") {
 		merchant, key, ok := strings.Cut(strings.TrimSpace(item), "=")
 		if !ok || merchant == "" || key == "" {
-			return nil, fmt.Errorf("invalid PAYMENT_API_KEYS entry %q", item)
+			return nil, errors.New("PAYMENT_API_KEYS entry must contain nonempty merchant_id=api_key")
 		}
 		if _, exists := result[merchant]; exists {
 			return nil, fmt.Errorf("merchant %q appears more than once in PAYMENT_API_KEYS", merchant)

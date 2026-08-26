@@ -9,7 +9,9 @@ import (
 	"mime"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/YouEclipse/payments/services/router/internal/decision"
 	"github.com/YouEclipse/payments/services/router/internal/routing"
 )
 
@@ -22,6 +24,8 @@ type decisionEngine interface {
 // Handler exposes the router's internal HTTP API.
 type Handler struct {
 	engine decisionEngine
+	v2     *decision.Engine
+	now    func() time.Time
 	logger *slog.Logger
 }
 
@@ -29,14 +33,19 @@ func NewHandler(engine decisionEngine, logger *slog.Logger) *Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Handler{engine: engine, logger: logger}
+	return &Handler{engine: engine, logger: logger, now: time.Now}
 }
+
+// WithV2 installs an independently configured reader-first v2 engine. Nil
+// deliberately leaves v2 unavailable; it never changes the legacy v1 engine.
+func (h *Handler) WithV2(engine *decision.Engine) *Handler { h.v2 = engine; return h }
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/livez", h.health)
 	mux.HandleFunc("/readyz", h.health)
 	mux.HandleFunc("/metrics", h.metrics)
 	mux.HandleFunc("/internal/v1/routing-decisions", h.routingDecisions)
+	mux.HandleFunc("/internal/v2/routing-decisions", h.routingDecisionsV2)
 }
 
 func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {

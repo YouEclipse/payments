@@ -44,7 +44,12 @@ func main() {
 		logger.Error("validate router configuration", "error", err)
 		os.Exit(1)
 	}
-	handler := httpapi.NewHandler(engine, logger)
+	v2, err := loadV2Engine(environment, os.Getenv("ROUTER_V2_CONFIG_JSON"))
+	if err != nil {
+		logger.Error("validate Router v2 configuration", "error", err)
+		os.Exit(1)
+	}
+	handler := httpapi.NewHandler(engine, logger).WithV2(v2)
 	mux := http.NewServeMux()
 	handler.Register(mux)
 

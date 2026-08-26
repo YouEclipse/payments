@@ -14,6 +14,7 @@ import (
 	"github.com/YouEclipse/payments/services/payment/internal/idempotency"
 	"github.com/YouEclipse/payments/services/payment/internal/identifier"
 	"github.com/YouEclipse/payments/services/payment/internal/postgres"
+	"github.com/YouEclipse/payments/services/payment/internal/routingcontext"
 )
 
 type Router interface {
@@ -32,12 +33,19 @@ type Service struct {
 	logger          *slog.Logger
 	upstreamTimeout time.Duration
 	now             func() time.Time
+	contextBuilder  *routingcontext.Builder
 }
 
 var ErrInvalidRequest = errors.New("invalid payment request")
 
-func NewService(store *postgres.Store, router Router, gateway Gateway, logger *slog.Logger, upstreamTimeout time.Duration) *Service {
-	return &Service{
+type Option func(*Service)
+
+func WithRoutingContext(builder *routingcontext.Builder) Option {
+	return func(service *Service) { service.contextBuilder = builder }
+}
+
+func NewService(store *postgres.Store, router Router, gateway Gateway, logger *slog.Logger, upstreamTimeout time.Duration, options ...Option) *Service {
+	service := &Service{
 		store:           store,
 		router:          router,
 		gateway:         gateway,
@@ -45,6 +53,10 @@ func NewService(store *postgres.Store, router Router, gateway Gateway, logger *s
 		upstreamTimeout: upstreamTimeout,
 		now:             time.Now,
 	}
+	for _, option := range options {
+		option(service)
+	}
+	return service
 }
 
 type CreateIntentInput struct {
@@ -161,18 +173,27 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 	}
 
 	routeContext, cancelRoute := context.WithTimeout(ctx, s.upstreamTimeout)
-	decision, err := s.router.Decide(routeContext, clients.RoutingRequest{
-		PaymentID:     intent.ID,
-		AttemptID:     attemptID,
-		MerchantID:    merchantID,
-		AmountMinor:   intent.AmountMinor,
-		Currency:      intent.Currency,
-		PaymentMethod: "card",
-		Operation:     "sale",
-	})
+	routingRequest, err := s.buildRoutingRequest(routeContext, intent, attemptID)
+	if err != nil {
+		cancelRoute()
+		return Result{}, err
+	}
+	decision, err := s.router.Decide(routeContext, routingRequest)
 	cancelRoute()
 	if err != nil {
 		return Result{}, err
+	}
+
+	var contextSnapshot, decisionSnapshot []byte
+	if routingRequest.Context != nil {
+		contextSnapshot, err = json.Marshal(routingRequest.Context)
+		if err != nil {
+			return Result{}, err
+		}
+		decisionSnapshot, err = json.Marshal(decision)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 
 	gatewayCommand := clients.GatewayOperationRequest{
@@ -203,6 +224,8 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 			PaymentIntentID:            intent.ID,
 			AttemptNumber:              1,
 			RoutingDecisionID:          decision.DecisionID,
+			RoutingContextSnapshot:     string(contextSnapshot),
+			RoutingDecisionSnapshot:    string(decisionSnapshot),
 			ProviderConnectionID:       decision.SelectedCandidate.CandidateID,
 			ProviderConnectionRevision: decision.SelectedCandidate.ConnectionRevision,
 			ProviderNamespaceID:        decision.SelectedCandidate.ProviderNamespaceID,
