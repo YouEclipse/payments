@@ -19,6 +19,11 @@ func TestStrictProfileArtifact(t *testing.T) {
 	for _, raw := range []string{
 		"null", "[]", string(encoded) + " {}",
 		strings.Replace(string(encoded), `"country":"US"`, `"country":"US","country":"GB"`, 1),
+		strings.Replace(string(encoded), `"country":"US"`, `"country":"US","Country":"GB"`, 1),
+		strings.Replace(string(encoded), `"country":"US"`, `"Country":"US"`, 1),
+		strings.Replace(string(encoded), `"merchant_id"`, `"MERCHANT_ID"`, 1),
+		strings.Replace(string(encoded), `"entity_id"`, `"Entity_Id"`, 1),
+		strings.Replace(string(encoded), `"version"`, `"Version"`, 1),
 		strings.Replace(string(encoded), `"country":"US"`, `"country":"US","payment_method_token":"secret"`, 1),
 		strings.Replace(string(encoded), `"merchant_demo"`, `""`, 1),
 	} {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 )
 
 // DecodeProfiles accepts one bounded, strict configuration artifact. In
@@ -55,7 +56,9 @@ func walkJSON(decoder *json.Decoder, depth int) error {
 				return err
 			}
 			name, ok := key.(string)
-			if !ok || seen[name] {
+			// encoding/json otherwise accepts case-insensitive field aliases,
+			// allowing Country to replace country despite distinct raw keys.
+			if !ok || name != strings.ToLower(name) || seen[name] {
 				return ErrInvalidContext
 			}
 			seen[name] = true
