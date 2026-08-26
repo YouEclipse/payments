@@ -31,25 +31,40 @@ func NewGatewayClient(baseURL, internalToken string, client *http.Client) (*Gate
 }
 
 type GatewayOperationRequest struct {
-	OperationID        string `json:"operation_id"`
-	AttemptID          string `json:"attempt_id"`
-	Provider           string `json:"provider"`
-	AmountMinor        int64  `json:"amount_minor"`
-	Currency           string `json:"currency"`
-	PaymentMethodToken string `json:"payment_method_token"`
-	CaptureMethod      string `json:"capture_method"`
-	Scenario           string `json:"scenario,omitempty"`
+	OperationID                string `json:"operation_id"`
+	AttemptID                  string `json:"attempt_id"`
+	ProviderConnectionID       string `json:"provider_connection_id"`
+	ProviderConnectionRevision string `json:"provider_connection_revision"`
+	ProviderNamespaceID        string `json:"provider_namespace_id"`
+	Provider                   string `json:"provider"`
+	AmountMinor                int64  `json:"amount_minor"`
+	Currency                   string `json:"currency"`
+	PaymentMethodToken         string `json:"payment_method_token"`
+	CaptureMethod              string `json:"capture_method"`
+	Scenario                   string `json:"scenario,omitempty"`
 }
 
 type GatewayOperationResponse struct {
-	OperationID            string `json:"operation_id"`
-	AttemptID              string `json:"attempt_id"`
-	Provider               string `json:"provider"`
-	ProviderIdempotencyKey string `json:"provider_idempotency_key"`
-	Status                 string `json:"status"`
-	SideEffectCertainty    string `json:"side_effect_certainty"`
-	ProviderReference      string `json:"provider_reference,omitempty"`
-	FailureCode            string `json:"failure_code,omitempty"`
+	OperationID                string `json:"operation_id"`
+	AttemptID                  string `json:"attempt_id"`
+	ProviderConnectionID       string `json:"provider_connection_id"`
+	ProviderConnectionRevision string `json:"provider_connection_revision"`
+	ProviderNamespaceID        string `json:"provider_namespace_id"`
+	Provider                   string `json:"provider"`
+	ProviderIdempotencyKey     string `json:"provider_idempotency_key"`
+	Status                     string `json:"status"`
+	SideEffectCertainty        string `json:"side_effect_certainty"`
+	ProviderReference          string `json:"provider_reference,omitempty"`
+	FailureCode                string `json:"failure_code,omitempty"`
+}
+
+type GatewayOperationIdentity struct {
+	OperationID                string
+	AttemptID                  string
+	ProviderConnectionID       string
+	ProviderConnectionRevision string
+	ProviderNamespaceID        string
+	Provider                   string
 }
 
 func (c *GatewayClient) Execute(ctx context.Context, command GatewayOperationRequest) (domain.ProviderOutcome, error) {
@@ -61,19 +76,26 @@ func (c *GatewayClient) Execute(ctx context.Context, command GatewayOperationReq
 	if err != nil {
 		return domain.ProviderOutcome{}, fmt.Errorf("build gateway operation: %w", err)
 	}
-	return c.do(request, command.OperationID)
+	return c.do(request, GatewayOperationIdentity{
+		OperationID:                command.OperationID,
+		AttemptID:                  command.AttemptID,
+		ProviderConnectionID:       command.ProviderConnectionID,
+		ProviderConnectionRevision: command.ProviderConnectionRevision,
+		ProviderNamespaceID:        command.ProviderNamespaceID,
+		Provider:                   command.Provider,
+	})
 }
 
-func (c *GatewayClient) Query(ctx context.Context, operationID string) (domain.ProviderOutcome, error) {
-	endpoint := c.baseURL + "/internal/v1/provider-operations/" + url.PathEscape(operationID) + "?reconcile=true"
+func (c *GatewayClient) Query(ctx context.Context, identity GatewayOperationIdentity) (domain.ProviderOutcome, error) {
+	endpoint := c.baseURL + "/internal/v1/provider-operations/" + url.PathEscape(identity.OperationID) + "?reconcile=true"
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return domain.ProviderOutcome{}, fmt.Errorf("build gateway query: %w", err)
 	}
-	return c.do(request, operationID)
+	return c.do(request, identity)
 }
 
-func (c *GatewayClient) do(request *http.Request, expectedOperationID string) (domain.ProviderOutcome, error) {
+func (c *GatewayClient) do(request *http.Request, expected GatewayOperationIdentity) (domain.ProviderOutcome, error) {
 	request.Header.Set("Accept", "application/json")
 	request.Header.Set("X-Internal-Token", c.internalToken)
 	if request.Method == http.MethodPost {
@@ -92,19 +114,49 @@ func (c *GatewayClient) do(request *http.Request, expectedOperationID string) (d
 		return domain.ProviderOutcome{}, ErrGatewayOperationNotFound
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		var problem struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if json.Unmarshal(payload, &problem) == nil {
+			switch problem.Error.Code {
+			case "provider_connection_identity_mismatch", "operation_id_reused":
+				return domain.ProviderOutcome{}, fmt.Errorf("%w: gateway rejected durable command (%s)", ErrGatewayIdentityMismatch, problem.Error.Code)
+			}
+		}
 		return domain.ProviderOutcome{}, fmt.Errorf("%w: gateway returned HTTP %d", ErrUpstream, response.StatusCode)
 	}
 	var gatewayResponse GatewayOperationResponse
 	if err := json.Unmarshal(payload, &gatewayResponse); err != nil {
 		return domain.ProviderOutcome{}, fmt.Errorf("%w: decode gateway response: %v", ErrUpstream, err)
 	}
-	if gatewayResponse.OperationID != expectedOperationID {
-		return domain.ProviderOutcome{}, fmt.Errorf("%w: gateway operation ID mismatch", ErrUpstream)
+	if gatewayResponse.OperationID != expected.OperationID {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: operation ID differs", ErrGatewayIdentityMismatch)
+	}
+	if gatewayResponse.AttemptID != expected.AttemptID {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: attempt ID differs", ErrGatewayIdentityMismatch)
+	}
+	if gatewayResponse.ProviderConnectionID != expected.ProviderConnectionID {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: provider connection ID differs", ErrGatewayIdentityMismatch)
+	}
+	if gatewayResponse.ProviderConnectionRevision != expected.ProviderConnectionRevision {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: provider connection revision differs", ErrGatewayIdentityMismatch)
+	}
+	if gatewayResponse.ProviderNamespaceID != expected.ProviderNamespaceID {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: provider namespace differs", ErrGatewayIdentityMismatch)
+	}
+	if gatewayResponse.Provider != expected.Provider {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: provider kind differs", ErrGatewayIdentityMismatch)
 	}
 	return NormalizeGatewayResponse(gatewayResponse)
 }
 
 func NormalizeGatewayResponse(response GatewayOperationResponse) (domain.ProviderOutcome, error) {
+	if !validPlatformIdentifier(response.ProviderConnectionID) || !validPlatformIdentifier(response.ProviderConnectionRevision) ||
+		!validPlatformIdentifier(response.ProviderNamespaceID) || response.Provider == "" {
+		return domain.ProviderOutcome{}, fmt.Errorf("%w: incomplete provider connection identity", ErrGatewayIdentityMismatch)
+	}
 	certainty := domain.SideEffectCertainty(response.SideEffectCertainty)
 	switch certainty {
 	case domain.SideEffectNone, domain.SideEffectPossible, domain.SideEffectConfirmed:
@@ -112,6 +164,9 @@ func NormalizeGatewayResponse(response GatewayOperationResponse) (domain.Provide
 		return domain.ProviderOutcome{}, fmt.Errorf("%w: invalid side_effect_certainty %q", ErrUpstream, response.SideEffectCertainty)
 	}
 	outcome := domain.ProviderOutcome{
+		ProviderConnectionID:       response.ProviderConnectionID,
+		ProviderConnectionRevision: response.ProviderConnectionRevision,
+		ProviderNamespaceID:        response.ProviderNamespaceID,
 		Provider:                   response.Provider,
 		OperationID:                response.OperationID,
 		ProviderIdempotencyKey:     response.ProviderIdempotencyKey,

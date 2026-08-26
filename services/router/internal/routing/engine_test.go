@@ -11,12 +11,18 @@ func TestEngineDecideFiltersBeforeApplyingStaticPolicy(t *testing.T) {
 
 	config := Config{
 		Policy: Policy{
-			Version:       "policy_v1",
-			ProviderOrder: []string{"psp_b", "psp_c", "psp_a"},
+			Version:        "policy_v1",
+			CandidateOrder: []string{"psp_b", "psp_c", "psp_a"},
 		},
 		Candidates: []Candidate{
 			{
+				ID:                      "psp_c",
+				ConnectionRevision:      "psp_c_v1",
+				ProviderNamespaceID:     "psp_c",
 				Provider:                "psp_c",
+				MerchantAccount:         "acct_c",
+				Connector:               "psp_c_connector",
+				Region:                  "us-east-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"EUR"},
 				SupportedPaymentMethods: []string{"card"},
@@ -25,7 +31,13 @@ func TestEngineDecideFiltersBeforeApplyingStaticPolicy(t *testing.T) {
 			eligibleCandidate("psp_a"),
 			eligibleCandidate("psp_b"),
 			{
+				ID:                      "psp_unlisted",
+				ConnectionRevision:      "psp_unlisted_v1",
+				ProviderNamespaceID:     "psp_unlisted",
 				Provider:                "psp_unlisted",
+				MerchantAccount:         "acct_unlisted",
+				Connector:               "psp_unlisted_connector",
+				Region:                  "us-east-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"USD"},
 				SupportedPaymentMethods: []string{"card"},
@@ -40,8 +52,8 @@ func TestEngineDecideFiltersBeforeApplyingStaticPolicy(t *testing.T) {
 		t.Fatalf("Decide() error = %v", err)
 	}
 
-	if decision.SelectedProvider != "psp_b" {
-		t.Fatalf("SelectedProvider = %q, want psp_b", decision.SelectedProvider)
+	if decision.SelectedCandidate.ID != "psp_b" {
+		t.Fatalf("SelectedCandidate.ID = %q, want psp_b", decision.SelectedCandidate.ID)
 	}
 	if want := []string{"psp_b", "psp_a"}; !reflect.DeepEqual(decision.CandidateOrder, want) {
 		t.Fatalf("CandidateOrder = %#v, want %#v", decision.CandidateOrder, want)
@@ -55,17 +67,19 @@ func TestEngineDecideFiltersBeforeApplyingStaticPolicy(t *testing.T) {
 
 	wantExclusions := []Exclusion{
 		{
-			Provider: "psp_c",
+			CandidateID: "psp_c",
+			Provider:    "psp_c",
 			Reasons: []Reason{{
 				Code:   ReasonCurrencyNotSupported,
 				Detail: "provider does not support currency USD",
 			}},
 		},
 		{
-			Provider: "psp_unlisted",
+			CandidateID: "psp_unlisted",
+			Provider:    "psp_unlisted",
 			Reasons: []Reason{{
 				Code:   ReasonNotInPolicy,
-				Detail: "provider is not present in the active static policy",
+				Detail: "candidate is not present in the active static policy",
 			}},
 		},
 	}
@@ -78,7 +92,7 @@ func TestEngineDecisionIsIndependentOfConfiguredCandidateOrder(t *testing.T) {
 	t.Parallel()
 
 	firstConfig := validConfig()
-	firstConfig.Policy.ProviderOrder = []string{"psp_b", "psp_a"}
+	firstConfig.Policy.CandidateOrder = []string{"psp_b", "psp_a"}
 	firstConfig.Candidates = []Candidate{eligibleCandidate("psp_a"), eligibleCandidate("psp_b")}
 
 	secondConfig := firstConfig
@@ -98,12 +112,40 @@ func TestEngineDecisionIsIndependentOfConfiguredCandidateOrder(t *testing.T) {
 	}
 }
 
+func TestDecisionDigestIncludesExecutionRevisionAndNamespace(t *testing.T) {
+	baseline, err := mustEngine(t, validConfig()).Decide(validRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"revision", "namespace"} {
+		t.Run(field, func(t *testing.T) {
+			config := validConfig()
+			if field == "revision" {
+				config.Candidates[0].ConnectionRevision = "psp_a_v2"
+			} else {
+				config.Candidates[0].ProviderNamespaceID = "psp_a_account_2"
+			}
+			decision, err := mustEngine(t, config).Decide(validRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision.ID == baseline.ID {
+				t.Fatalf("decision digest ignored %s", field)
+			}
+			if decision.SelectedCandidate.ConnectionRevision != config.Candidates[0].ConnectionRevision ||
+				decision.SelectedCandidate.ProviderNamespaceID != config.Candidates[0].ProviderNamespaceID {
+				t.Fatalf("decision lost pinned execution identity: %+v", decision.SelectedCandidate)
+			}
+		})
+	}
+}
+
 func TestEngineOwnsImmutableConfiguration(t *testing.T) {
 	t.Parallel()
 
 	config := validConfig()
 	engine := mustEngine(t, config)
-	config.Policy.ProviderOrder[0] = "mutated"
+	config.Policy.CandidateOrder[0] = "mutated"
 	config.Candidates[0].Enabled = false
 	config.Candidates[0].SupportedCurrencies[0] = "JPY"
 
@@ -111,8 +153,8 @@ func TestEngineOwnsImmutableConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decide() error = %v", err)
 	}
-	if decision.SelectedProvider != "psp_a" {
-		t.Fatalf("SelectedProvider = %q, want psp_a", decision.SelectedProvider)
+	if decision.SelectedCandidate.ID != "psp_a" {
+		t.Fatalf("SelectedCandidate.ID = %q, want psp_a", decision.SelectedCandidate.ID)
 	}
 }
 
@@ -138,7 +180,7 @@ func TestEngineNoEligibleProviderReturnsDecisionEvidence(t *testing.T) {
 	}
 }
 
-func TestEngineRejectsDuplicateConfiguredProvider(t *testing.T) {
+func TestEngineRejectsDuplicateCandidateID(t *testing.T) {
 	t.Parallel()
 
 	config := validConfig()
@@ -149,8 +191,44 @@ func TestEngineRejectsDuplicateConfiguredProvider(t *testing.T) {
 	if !errors.As(err, &validationErr) {
 		t.Fatalf("NewEngine() error = %v, want ValidationError", err)
 	}
-	if validationErr.Field != "candidates[1].provider" {
-		t.Fatalf("ValidationError.Field = %q, want candidates[1].provider", validationErr.Field)
+	if validationErr.Field != "candidates[1].candidate_id" {
+		t.Fatalf("ValidationError.Field = %q, want candidates[1].candidate_id", validationErr.Field)
+	}
+}
+
+func TestEngineRejectsNonCanonicalConnectionIdentity(t *testing.T) {
+	t.Parallel()
+
+	config := validConfig()
+	config.Candidates[0].ID = " psp_a"
+	config.Policy.CandidateOrder[0] = " psp_a"
+
+	_, err := NewEngine(config)
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("NewEngine() error = %v, want ValidationError", err)
+	}
+	if validationErr.Field != "candidates[0].candidate_id" {
+		t.Fatalf("ValidationError.Field = %q, want candidates[0].candidate_id", validationErr.Field)
+	}
+}
+
+func TestEngineRejectsAliasesForTheSameExecutionConnection(t *testing.T) {
+	t.Parallel()
+
+	config := validConfig()
+	alias := config.Candidates[0]
+	alias.ID = "psp_a_alias"
+	config.Candidates = append(config.Candidates, alias)
+	config.Policy.CandidateOrder = append(config.Policy.CandidateOrder, alias.ID)
+
+	_, err := NewEngine(config)
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("NewEngine() error = %v, want ValidationError", err)
+	}
+	if validationErr.Field != "candidates[1].candidate_id" {
+		t.Fatalf("ValidationError.Field = %q, want candidates[1].candidate_id", validationErr.Field)
 	}
 }
 
@@ -179,8 +257,32 @@ func TestEngineSupportsAuthorizeForFutureManualCapture(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decide(authorize) error = %v", err)
 	}
-	if decision.SelectedProvider != "psp_a" {
-		t.Fatalf("SelectedProvider = %q, want psp_a", decision.SelectedProvider)
+	if decision.SelectedCandidate.ID != "psp_a" {
+		t.Fatalf("SelectedCandidate.ID = %q, want psp_a", decision.SelectedCandidate.ID)
+	}
+}
+
+func TestEngineDistinguishesTwoConnectionsForSameProvider(t *testing.T) {
+	t.Parallel()
+
+	primary := eligibleCandidate("psp_a_us_primary")
+	primary.Provider = "psp_a"
+	primary.MerchantAccount = "acct_us"
+	backup := eligibleCandidate("psp_a_eu_backup")
+	backup.Provider = "psp_a"
+	backup.MerchantAccount = "acct_eu"
+	backup.Region = "eu-west-1"
+	config := Config{
+		Policy:     Policy{Version: "policy_v2", CandidateOrder: []string{backup.ID, primary.ID}},
+		Candidates: []Candidate{primary, backup},
+	}
+
+	decision, err := mustEngine(t, config).Decide(validRequest())
+	if err != nil {
+		t.Fatalf("Decide() error = %v", err)
+	}
+	if decision.SelectedCandidate.ID != backup.ID || decision.SelectedCandidate.Provider != "psp_a" || decision.SelectedCandidate.MerchantAccount != "acct_eu" {
+		t.Fatalf("SelectedCandidate = %#v, want exact EU connection", decision.SelectedCandidate)
 	}
 }
 
@@ -199,16 +301,22 @@ func validRequest() Request {
 func validConfig() Config {
 	return Config{
 		Policy: Policy{
-			Version:       "policy_v1",
-			ProviderOrder: []string{"psp_a"},
+			Version:        "policy_v1",
+			CandidateOrder: []string{"psp_a"},
 		},
 		Candidates: []Candidate{eligibleCandidate("psp_a")},
 	}
 }
 
-func eligibleCandidate(provider string) Candidate {
+func eligibleCandidate(candidateID string) Candidate {
 	return Candidate{
-		Provider:                provider,
+		ID:                      candidateID,
+		ConnectionRevision:      candidateID + "_v1",
+		ProviderNamespaceID:     candidateID,
+		Provider:                candidateID,
+		MerchantAccount:         "acct_" + candidateID,
+		Connector:               candidateID + "_connector",
+		Region:                  "us-east-1",
 		Enabled:                 true,
 		SupportedCurrencies:     []string{"USD", "EUR"},
 		SupportedPaymentMethods: []string{"card"},

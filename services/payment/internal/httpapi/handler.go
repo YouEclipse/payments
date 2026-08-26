@@ -98,16 +98,19 @@ func (h *Handler) getIntent(response http.ResponseWriter, request *http.Request)
 }
 
 type providerOutcomeRequest struct {
-	EventID                string    `json:"event_id"`
-	OperationID            string    `json:"operation_id"`
-	AttemptID              string    `json:"attempt_id,omitempty"`
-	Provider               string    `json:"provider"`
-	ProviderIdempotencyKey string    `json:"provider_idempotency_key"`
-	Status                 string    `json:"status"`
-	SideEffectCertainty    string    `json:"side_effect_certainty"`
-	ProviderReference      string    `json:"provider_reference,omitempty"`
-	FailureCode            string    `json:"failure_code,omitempty"`
-	OccurredAt             time.Time `json:"occurred_at,omitempty"`
+	EventID                    string    `json:"event_id"`
+	OperationID                string    `json:"operation_id"`
+	AttemptID                  string    `json:"attempt_id,omitempty"`
+	ProviderConnectionID       string    `json:"provider_connection_id"`
+	ProviderConnectionRevision string    `json:"provider_connection_revision"`
+	ProviderNamespaceID        string    `json:"provider_namespace_id"`
+	Provider                   string    `json:"provider"`
+	ProviderIdempotencyKey     string    `json:"provider_idempotency_key"`
+	Status                     string    `json:"status"`
+	SideEffectCertainty        string    `json:"side_effect_certainty"`
+	ProviderReference          string    `json:"provider_reference,omitempty"`
+	FailureCode                string    `json:"failure_code,omitempty"`
+	OccurredAt                 time.Time `json:"occurred_at,omitempty"`
 }
 
 func (h *Handler) providerOutcome(response http.ResponseWriter, request *http.Request) {
@@ -125,14 +128,17 @@ func (h *Handler) providerOutcome(response http.ResponseWriter, request *http.Re
 	}
 	raw, _ := json.Marshal(input)
 	outcome, err := clients.NormalizeGatewayResponse(clients.GatewayOperationResponse{
-		OperationID:            input.OperationID,
-		AttemptID:              input.AttemptID,
-		Provider:               input.Provider,
-		ProviderIdempotencyKey: input.ProviderIdempotencyKey,
-		Status:                 input.Status,
-		SideEffectCertainty:    input.SideEffectCertainty,
-		ProviderReference:      input.ProviderReference,
-		FailureCode:            input.FailureCode,
+		OperationID:                input.OperationID,
+		AttemptID:                  input.AttemptID,
+		ProviderConnectionID:       input.ProviderConnectionID,
+		ProviderConnectionRevision: input.ProviderConnectionRevision,
+		ProviderNamespaceID:        input.ProviderNamespaceID,
+		Provider:                   input.Provider,
+		ProviderIdempotencyKey:     input.ProviderIdempotencyKey,
+		Status:                     input.Status,
+		SideEffectCertainty:        input.SideEffectCertainty,
+		ProviderReference:          input.ProviderReference,
+		FailureCode:                input.FailureCode,
 	})
 	if err != nil {
 		writeError(response, http.StatusBadRequest, "invalid_provider_outcome", err.Error())

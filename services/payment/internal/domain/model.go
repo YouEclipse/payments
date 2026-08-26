@@ -125,18 +125,21 @@ type PaymentIntent struct {
 }
 
 type PaymentAttempt struct {
-	ID                       string
-	PaymentIntentID          string
-	AttemptNumber            int
-	RoutingDecisionID        string
-	Provider                 string
-	Status                   AttemptStatus
-	OutcomeCode              string
-	RerouteDisposition       RerouteDisposition
-	ProviderPaymentReference string
-	Version                  int64
-	CreatedAt                time.Time
-	UpdatedAt                time.Time
+	ID                         string
+	PaymentIntentID            string
+	AttemptNumber              int
+	RoutingDecisionID          string
+	ProviderConnectionID       string
+	ProviderConnectionRevision string
+	ProviderNamespaceID        string
+	Provider                   string
+	Status                     AttemptStatus
+	OutcomeCode                string
+	RerouteDisposition         RerouteDisposition
+	ProviderPaymentReference   string
+	Version                    int64
+	CreatedAt                  time.Time
+	UpdatedAt                  time.Time
 }
 
 type ProviderOperation struct {
@@ -146,6 +149,9 @@ type ProviderOperation struct {
 	Kind                       OperationKind
 	AmountMinor                int64
 	Currency                   string
+	ProviderConnectionID       string
+	ProviderConnectionRevision string
+	ProviderNamespaceID        string
 	Provider                   string
 	ProviderIdempotencyKey     string
 	MerchantReference          string
@@ -167,6 +173,9 @@ type ProviderOperation struct {
 
 type ProviderOutcome struct {
 	EventID                    string
+	ProviderConnectionID       string
+	ProviderConnectionRevision string
+	ProviderNamespaceID        string
 	Provider                   string
 	OperationID                string
 	ProviderIdempotencyKey     string
@@ -237,8 +246,17 @@ func PrepareConfirmation(intent *PaymentIntent, attempt *PaymentAttempt, operati
 	if operation.AmountMinor != intent.AmountMinor || operation.Currency != intent.Currency {
 		return errors.New("operation amount and currency must equal the immutable intent")
 	}
+	if attempt.ProviderConnectionID == "" || operation.ProviderConnectionID != attempt.ProviderConnectionID {
+		return errors.New("attempt and operation provider connection must match")
+	}
+	if attempt.ProviderConnectionRevision == "" || operation.ProviderConnectionRevision != attempt.ProviderConnectionRevision {
+		return errors.New("attempt and operation provider connection revision must match")
+	}
+	if attempt.ProviderNamespaceID == "" || operation.ProviderNamespaceID != attempt.ProviderNamespaceID {
+		return errors.New("attempt and operation provider namespace must match")
+	}
 	if attempt.Provider == "" || operation.Provider != attempt.Provider {
-		return errors.New("attempt and operation provider must match")
+		return errors.New("attempt and operation provider kind must match")
 	}
 	if operation.ProviderIdempotencyKey == "" || len(operation.RequestHash) == 0 {
 		return errors.New("provider idempotency key and request hash are required")
@@ -286,8 +304,17 @@ func ApplyProviderOutcome(intent *PaymentIntent, attempt *PaymentAttempt, operat
 	if operation.PaymentIntentID != intent.ID || operation.PaymentAttemptID != attempt.ID {
 		return ApplyResult{}, errors.New("operation aggregate does not match")
 	}
+	if outcome.ProviderConnectionID != operation.ProviderConnectionID {
+		return ApplyResult{}, errors.New("provider outcome does not match operation provider connection")
+	}
+	if outcome.ProviderConnectionRevision != operation.ProviderConnectionRevision {
+		return ApplyResult{}, errors.New("provider outcome does not match operation provider connection revision")
+	}
+	if outcome.ProviderNamespaceID != operation.ProviderNamespaceID {
+		return ApplyResult{}, errors.New("provider outcome does not match operation provider namespace")
+	}
 	if outcome.Provider != operation.Provider {
-		return ApplyResult{}, errors.New("provider outcome does not match operation provider")
+		return ApplyResult{}, errors.New("provider outcome does not match operation provider kind")
 	}
 	if outcome.OperationID != "" && outcome.OperationID != operation.ID {
 		return ApplyResult{}, errors.New("provider outcome operation ID does not match")

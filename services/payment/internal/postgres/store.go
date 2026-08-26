@@ -203,11 +203,13 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 
 	_, err = tx.Exec(ctx, `
 		INSERT INTO payment_attempts (
-			id, payment_intent_id, attempt_number, routing_decision_id, provider,
+			id, payment_intent_id, attempt_number, routing_decision_id,
+			provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
 			status, outcome_code, reroute_disposition, provider_payment_reference,
 			version, created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,NULL,$7,NULL,$8,$9,$10)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,$11,$12,$13)`,
 		attempt.ID, attempt.PaymentIntentID, attempt.AttemptNumber, attempt.RoutingDecisionID,
+		attempt.ProviderConnectionID, attempt.ProviderConnectionRevision, attempt.ProviderNamespaceID,
 		attempt.Provider, attempt.Status, attempt.RerouteDisposition, attempt.Version,
 		attempt.CreatedAt, attempt.UpdatedAt,
 	)
@@ -218,12 +220,14 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 	_, err = tx.Exec(ctx, `
 		INSERT INTO provider_operations (
 			id, payment_intent_id, payment_attempt_id, kind, amount_minor, currency,
-			provider, provider_idempotency_key, merchant_reference, request_hash,
+			provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
+			provider_idempotency_key, merchant_reference, request_hash,
 			status, side_effect_certainty, retry_mode, retry_count, version,
 			created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		operation.ID, operation.PaymentIntentID, operation.PaymentAttemptID, operation.Kind,
-		operation.AmountMinor, operation.Currency, operation.Provider,
+		operation.AmountMinor, operation.Currency, operation.ProviderConnectionID,
+		operation.ProviderConnectionRevision, operation.ProviderNamespaceID, operation.Provider,
 		operation.ProviderIdempotencyKey, operation.MerchantReference, operation.RequestHash,
 		operation.Status, operation.SideEffectCertainty, operation.RetryMode,
 		operation.RetryCount, operation.Version, operation.CreatedAt, operation.UpdatedAt,
@@ -244,10 +248,13 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 		return PrepareConfirmationResult{}, err
 	}
 	if err := insertOutbox(ctx, tx, "provider_operation", operation.ID, operation.Version, "provider_operation.created", map[string]any{
-		"operation_id":       operation.ID,
-		"payment_intent_id":  intent.ID,
-		"payment_attempt_id": attempt.ID,
-		"provider":           operation.Provider,
+		"operation_id":                 operation.ID,
+		"payment_intent_id":            intent.ID,
+		"payment_attempt_id":           attempt.ID,
+		"provider_connection_id":       operation.ProviderConnectionID,
+		"provider_connection_revision": operation.ProviderConnectionRevision,
+		"provider_namespace_id":        operation.ProviderNamespaceID,
+		"provider":                     operation.Provider,
 	}, command.Now); err != nil {
 		return PrepareConfirmationResult{}, err
 	}
@@ -306,27 +313,31 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 		}
 		commandTag, err := tx.Exec(ctx, `
 			INSERT INTO provider_outcome_inbox (
-				provider,event_id,operation_id,provider_idempotency_key,status,
+				provider_namespace_id,provider_connection_id,provider_connection_revision,provider,event_id,
+				operation_id,provider_idempotency_key,status,
 				side_effect_certainty,normalized_code,provider_code,
 				provider_payment_reference,provider_operation_reference,
 				occurred_at,received_at,processing_status,sanitized_payload
-			) VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,$6,NULLIF($7,''),NULLIF($8,''),
-			          NULLIF($9,''),NULLIF($10,''),$11,$12,'received',$13)
-			ON CONFLICT (provider,event_id) DO NOTHING`,
+			) VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9,NULLIF($10,''),NULLIF($11,''),
+			          NULLIF($12,''),NULLIF($13,''),$14,$15,'received',$16)
+			ON CONFLICT (provider_namespace_id,event_id) DO NOTHING`,
+			outcome.ProviderNamespaceID, outcome.ProviderConnectionID, outcome.ProviderConnectionRevision,
 			outcome.Provider, outcome.EventID, outcome.OperationID, outcome.ProviderIdempotencyKey,
 			outcome.Status, outcome.SideEffectCertainty, outcome.NormalizedCode, outcome.ProviderCode,
-			outcome.ProviderPaymentReference, outcome.ProviderOperationReference,
-			occurredAt, receivedAt, sanitizedPayload,
+			outcome.ProviderPaymentReference, outcome.ProviderOperationReference, occurredAt, receivedAt, sanitizedPayload,
 		)
 		if err != nil {
 			return ApplyOutcomeResult{}, fmt.Errorf("insert provider outcome inbox: %w", err)
 		}
 		if commandTag.RowsAffected() == 0 {
-			stored, loadErr := getInboxCorrelationTx(ctx, tx, outcome.Provider, outcome.EventID, sanitizedPayload)
+			stored, loadErr := getInboxCorrelationTx(ctx, tx, outcome.ProviderNamespaceID, outcome.EventID, sanitizedPayload)
 			if loadErr != nil {
 				return ApplyOutcomeResult{}, loadErr
 			}
-			storedOperationID, resolveErr := resolveOperationIDTx(ctx, tx, outcome.Provider, stored.OperationID, stored.ProviderIdempotencyKey)
+			storedOperationID, resolveErr := resolveOperationIDTx(
+				ctx, tx, stored.ProviderConnectionID, stored.ProviderConnectionRevision,
+				stored.ProviderNamespaceID, stored.OperationID, stored.ProviderIdempotencyKey,
+			)
 			var aggregate Aggregate
 			if resolveErr == nil {
 				aggregate, loadErr = getAggregateByOperationTx(ctx, tx, storedOperationID, false)
@@ -363,7 +374,10 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 
 	operationID := outcome.OperationID
 	if operationID == "" {
-		operationID, err = resolveOperationIDTx(ctx, tx, outcome.Provider, "", outcome.ProviderIdempotencyKey)
+		operationID, err = resolveOperationIDTx(
+			ctx, tx, outcome.ProviderConnectionID, outcome.ProviderConnectionRevision,
+			outcome.ProviderNamespaceID, "", outcome.ProviderIdempotencyKey,
+		)
 		if errors.Is(err, ErrNotFound) {
 			reason := "provider outcome does not correlate to a known operation"
 			if quarantineErr := quarantineOutcomeTx(ctx, tx, outcome, sanitizedPayload, receivedAt, "rejected", reason); quarantineErr != nil {
@@ -380,7 +394,7 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 		outcome.OperationID = operationID
 	}
 	if outcome.ProviderPaymentReference != "" {
-		if err := lockProviderReferenceTx(ctx, tx, outcome.Provider, outcome.ProviderPaymentReference); err != nil {
+		if err := lockProviderReferenceTx(ctx, tx, outcome.ProviderNamespaceID, outcome.ProviderPaymentReference); err != nil {
 			return ApplyOutcomeResult{}, err
 		}
 	}
@@ -400,7 +414,10 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 		return ApplyOutcomeResult{}, err
 	}
 	originalAggregate := aggregate
-	if outcome.Provider != aggregate.Operation.Provider ||
+	if outcome.ProviderConnectionID != aggregate.Operation.ProviderConnectionID ||
+		outcome.ProviderConnectionRevision != aggregate.Operation.ProviderConnectionRevision ||
+		outcome.ProviderNamespaceID != aggregate.Operation.ProviderNamespaceID ||
+		outcome.Provider != aggregate.Operation.Provider ||
 		(outcome.ProviderIdempotencyKey != "" && outcome.ProviderIdempotencyKey != aggregate.Operation.ProviderIdempotencyKey) {
 		reason := "provider outcome correlation does not match the durable operation"
 		if err := quarantineOutcomeTx(ctx, tx, outcome, sanitizedPayload, receivedAt, "rejected", reason); err != nil {
@@ -412,7 +429,7 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 		return ApplyOutcomeResult{Aggregate: originalAggregate, Rejected: true}, nil
 	}
 	if outcome.ProviderPaymentReference != "" {
-		existingAttemptID, err := providerReferenceOwnerTx(ctx, tx, aggregate.Operation.Provider, outcome.ProviderPaymentReference)
+		existingAttemptID, err := providerReferenceOwnerTx(ctx, tx, aggregate.Operation.ProviderNamespaceID, outcome.ProviderPaymentReference)
 		if err != nil {
 			return ApplyOutcomeResult{}, err
 		}
@@ -482,7 +499,7 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 		if _, err := tx.Exec(ctx, `
 			UPDATE provider_outcome_inbox
 			SET processing_status=$3, processed_at=$4
-			WHERE provider=$1 AND event_id=$2`, outcome.Provider, outcome.EventID, processingStatus, receivedAt,
+			WHERE provider_namespace_id=$1 AND event_id=$2`, outcome.ProviderNamespaceID, outcome.EventID, processingStatus, receivedAt,
 		); err != nil {
 			return ApplyOutcomeResult{}, fmt.Errorf("complete provider inbox event: %w", err)
 		}
@@ -498,20 +515,25 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 }
 
 type inboxCorrelation struct {
-	OperationID            string
-	ProviderIdempotencyKey string
-	ProcessingStatus       string
-	PayloadMatches         bool
+	ProviderConnectionID       string
+	ProviderConnectionRevision string
+	ProviderNamespaceID        string
+	OperationID                string
+	ProviderIdempotencyKey     string
+	ProcessingStatus           string
+	PayloadMatches             bool
 }
 
-func getInboxCorrelationTx(ctx context.Context, tx pgx.Tx, provider, eventID string, sanitizedPayload []byte) (inboxCorrelation, error) {
+func getInboxCorrelationTx(ctx context.Context, tx pgx.Tx, providerNamespaceID, eventID string, sanitizedPayload []byte) (inboxCorrelation, error) {
 	var correlation inboxCorrelation
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(operation_id,''),COALESCE(provider_idempotency_key,''),processing_status,
+		SELECT provider_connection_id,provider_connection_revision,provider_namespace_id,
+		       COALESCE(operation_id,''),COALESCE(provider_idempotency_key,''),processing_status,
 		       sanitized_payload = $3::jsonb
 		FROM provider_outcome_inbox
-		WHERE provider=$1 AND event_id=$2
-		FOR UPDATE`, provider, eventID, sanitizedPayload).Scan(
+		WHERE provider_namespace_id=$1 AND event_id=$2
+		FOR UPDATE`, providerNamespaceID, eventID, sanitizedPayload).Scan(
+		&correlation.ProviderConnectionID, &correlation.ProviderConnectionRevision, &correlation.ProviderNamespaceID,
 		&correlation.OperationID, &correlation.ProviderIdempotencyKey, &correlation.ProcessingStatus,
 		&correlation.PayloadMatches,
 	)
@@ -524,7 +546,11 @@ func getInboxCorrelationTx(ctx context.Context, tx pgx.Tx, provider, eventID str
 	return correlation, nil
 }
 
-func resolveOperationIDTx(ctx context.Context, tx pgx.Tx, provider, operationID, providerIdempotencyKey string) (string, error) {
+func resolveOperationIDTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	providerConnectionID, providerConnectionRevision, providerNamespaceID, operationID, providerIdempotencyKey string,
+) (string, error) {
 	if operationID != "" {
 		return operationID, nil
 	}
@@ -533,8 +559,11 @@ func resolveOperationIDTx(ctx context.Context, tx pgx.Tx, provider, operationID,
 	}
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM provider_operations
-		WHERE provider=$1 AND provider_idempotency_key=$2`,
-		provider, providerIdempotencyKey,
+		WHERE provider_connection_id=$1
+		  AND provider_connection_revision=$2
+		  AND provider_namespace_id=$3
+		  AND provider_idempotency_key=$4`,
+		providerConnectionID, providerConnectionRevision, providerNamespaceID, providerIdempotencyKey,
 	).Scan(&operationID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNotFound
@@ -549,6 +578,12 @@ func correlationMismatch(storedOperationID string, aggregate Aggregate, incoming
 	if incoming.OperationID != "" && storedOperationID != incoming.OperationID {
 		return true
 	}
+	if incoming.ProviderConnectionID != aggregate.Operation.ProviderConnectionID ||
+		incoming.ProviderConnectionRevision != aggregate.Operation.ProviderConnectionRevision ||
+		incoming.ProviderNamespaceID != aggregate.Operation.ProviderNamespaceID ||
+		incoming.Provider != aggregate.Operation.Provider {
+		return true
+	}
 	return incoming.ProviderIdempotencyKey != "" &&
 		incoming.ProviderIdempotencyKey != aggregate.Operation.ProviderIdempotencyKey
 }
@@ -560,15 +595,17 @@ func quarantineOutcomeTx(ctx context.Context, tx pgx.Tx, outcome domain.Provider
 	if _, err := tx.Exec(ctx, `
 		UPDATE provider_outcome_inbox
 		SET processing_status=$3,processed_at=$4,rejection_reason=$5
-		WHERE provider=$1 AND event_id=$2`,
-		outcome.Provider, outcome.EventID, status, receivedAt, reason,
+		WHERE provider_namespace_id=$1 AND event_id=$2`,
+		outcome.ProviderNamespaceID, outcome.EventID, status, receivedAt, reason,
 	); err != nil {
 		return fmt.Errorf("quarantine provider inbox event: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO provider_outcome_quarantine (
-			provider,event_id,operation_id,provider_idempotency_key,reason,sanitized_payload,received_at
-		) VALUES ($1,$2,NULLIF($3,''),NULLIF($4,''),$5,$6,$7)`,
+			provider_namespace_id,provider_connection_id,provider_connection_revision,provider,event_id,
+			operation_id,provider_idempotency_key,reason,sanitized_payload,received_at
+		) VALUES ($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$8,$9,$10)`,
+		outcome.ProviderNamespaceID, outcome.ProviderConnectionID, outcome.ProviderConnectionRevision,
 		outcome.Provider, outcome.EventID, outcome.OperationID, outcome.ProviderIdempotencyKey,
 		reason, sanitizedPayload, receivedAt,
 	); err != nil {
@@ -597,30 +634,30 @@ func completeIdempotencyForAggregateTx(ctx context.Context, tx pgx.Tx, aggregate
 	return nil
 }
 
-func lockProviderReferenceTx(ctx context.Context, tx pgx.Tx, provider, providerReference string) error {
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, providerReferenceLockID(provider, providerReference)); err != nil {
+func lockProviderReferenceTx(ctx context.Context, tx pgx.Tx, providerNamespaceID, providerReference string) error {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, providerReferenceLockID(providerNamespaceID, providerReference)); err != nil {
 		return fmt.Errorf("lock provider payment reference: %w", err)
 	}
 	return nil
 }
 
-func providerReferenceLockID(provider, providerReference string) int64 {
-	material := make([]byte, 16+len(provider)+len(providerReference))
-	binary.BigEndian.PutUint64(material[0:8], uint64(len(provider)))
-	copy(material[8:8+len(provider)], provider)
-	referenceOffset := 8 + len(provider)
+func providerReferenceLockID(providerNamespaceID, providerReference string) int64 {
+	material := make([]byte, 16+len(providerNamespaceID)+len(providerReference))
+	binary.BigEndian.PutUint64(material[0:8], uint64(len(providerNamespaceID)))
+	copy(material[8:8+len(providerNamespaceID)], providerNamespaceID)
+	referenceOffset := 8 + len(providerNamespaceID)
 	binary.BigEndian.PutUint64(material[referenceOffset:referenceOffset+8], uint64(len(providerReference)))
 	copy(material[referenceOffset+8:], providerReference)
 	digest := sha256.Sum256(material)
 	return int64(binary.BigEndian.Uint64(digest[:8]))
 }
 
-func providerReferenceOwnerTx(ctx context.Context, tx pgx.Tx, provider, providerReference string) (string, error) {
+func providerReferenceOwnerTx(ctx context.Context, tx pgx.Tx, providerNamespaceID, providerReference string) (string, error) {
 	var existingAttemptID string
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM payment_attempts
-		WHERE provider=$1 AND provider_payment_reference=$2
-		LIMIT 1`, provider, providerReference,
+		WHERE provider_namespace_id=$1 AND provider_payment_reference=$2
+		LIMIT 1`, providerNamespaceID, providerReference,
 	).Scan(&existingAttemptID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
@@ -869,7 +906,8 @@ func getAggregateByOperationTx(ctx context.Context, query queryer, operationID s
 	}
 	operationRow := query.QueryRow(ctx, `
 		SELECT id,payment_intent_id,payment_attempt_id,kind,amount_minor,currency,
-		       provider,provider_idempotency_key,merchant_reference,request_hash,status,
+		       provider_connection_id,provider_connection_revision,provider_namespace_id,provider,
+		       provider_idempotency_key,merchant_reference,request_hash,status,
 		       side_effect_certainty,retry_mode,COALESCE(provider_operation_reference,''),
 		       COALESCE(normalized_code,''),COALESCE(provider_code,''),retry_count,
 		       next_retry_at,COALESCE(last_error,''),version,created_at,updated_at,completed_at
@@ -882,7 +920,8 @@ func getAggregateByOperationTx(ctx context.Context, query queryer, operationID s
 		return Aggregate{}, fmt.Errorf("read provider operation: %w", err)
 	}
 	attemptRow := query.QueryRow(ctx, `
-		SELECT id,payment_intent_id,attempt_number,routing_decision_id,provider,status,
+		SELECT id,payment_intent_id,attempt_number,routing_decision_id,
+		       provider_connection_id,provider_connection_revision,provider_namespace_id,provider,status,
 		       COALESCE(outcome_code,''),reroute_disposition,
 		       COALESCE(provider_payment_reference,''),version,created_at,updated_at
 		FROM payment_attempts WHERE id=$1`+suffix, operation.PaymentAttemptID)
@@ -913,7 +952,8 @@ func scanAttempt(row rowScanner) (domain.PaymentAttempt, error) {
 	var attempt domain.PaymentAttempt
 	err := row.Scan(
 		&attempt.ID, &attempt.PaymentIntentID, &attempt.AttemptNumber,
-		&attempt.RoutingDecisionID, &attempt.Provider, &attempt.Status,
+		&attempt.RoutingDecisionID, &attempt.ProviderConnectionID, &attempt.ProviderConnectionRevision,
+		&attempt.ProviderNamespaceID, &attempt.Provider, &attempt.Status,
 		&attempt.OutcomeCode, &attempt.RerouteDisposition, &attempt.ProviderPaymentReference,
 		&attempt.Version, &attempt.CreatedAt, &attempt.UpdatedAt,
 	)
@@ -924,7 +964,8 @@ func scanOperation(row rowScanner) (domain.ProviderOperation, error) {
 	var operation domain.ProviderOperation
 	err := row.Scan(
 		&operation.ID, &operation.PaymentIntentID, &operation.PaymentAttemptID,
-		&operation.Kind, &operation.AmountMinor, &operation.Currency, &operation.Provider,
+		&operation.Kind, &operation.AmountMinor, &operation.Currency, &operation.ProviderConnectionID,
+		&operation.ProviderConnectionRevision, &operation.ProviderNamespaceID, &operation.Provider,
 		&operation.ProviderIdempotencyKey, &operation.MerchantReference,
 		&operation.RequestHash, &operation.Status, &operation.SideEffectCertainty,
 		&operation.RetryMode, &operation.ProviderOperationReference,

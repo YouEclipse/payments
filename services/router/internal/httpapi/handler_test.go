@@ -29,8 +29,8 @@ func TestRoutingDecision(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&decision); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if decision.SelectedProvider != "psp_b" {
-		t.Fatalf("SelectedProvider = %q, want psp_b", decision.SelectedProvider)
+	if decision.SelectedCandidate.ID != "psp_b" {
+		t.Fatalf("SelectedCandidate.ID = %q, want psp_b", decision.SelectedCandidate.ID)
 	}
 	if len(decision.CandidateOrder) != 1 || decision.CandidateOrder[0] != "psp_b" {
 		t.Fatalf("CandidateOrder = %#v, want [psp_b]", decision.CandidateOrder)
@@ -47,7 +47,7 @@ func TestRoutingDecisionRejectsCallerSuppliedPolicy(t *testing.T) {
 	payload := strings.Replace(
 		validRequestJSON(),
 		`"operation":"sale"`,
-		`"operation":"sale","policy":{"version":"caller_override","provider_order":["psp_a"]}`,
+		`"operation":"sale","policy":{"version":"caller_override","candidate_order":["psp_a"]}`,
 		1,
 	)
 	response := postJSON(t, server.URL+"/internal/v1/routing-decisions", payload)
@@ -147,19 +147,31 @@ func newTestServer(t *testing.T) *httptest.Server {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	engine, err := routing.NewEngine(routing.Config{
 		Policy: routing.Policy{
-			Version:       "policy_v1",
-			ProviderOrder: []string{"psp_b", "psp_a"},
+			Version:        "policy_v1",
+			CandidateOrder: []string{"psp_b", "psp_a"},
 		},
 		Candidates: []routing.Candidate{
 			{
+				ID:                      "psp_a",
+				ConnectionRevision:      "psp_a_v1",
+				ProviderNamespaceID:     "psp_a",
 				Provider:                "psp_a",
+				MerchantAccount:         "acct_a",
+				Connector:               "psp_a_connector",
+				Region:                  "us-east-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"EUR"},
 				SupportedPaymentMethods: []string{"card"},
 				SupportedOperations:     []string{"sale", "authorize"},
 			},
 			{
+				ID:                      "psp_b",
+				ConnectionRevision:      "psp_b_v1",
+				ProviderNamespaceID:     "psp_b",
 				Provider:                "psp_b",
+				MerchantAccount:         "acct_b",
+				Connector:               "psp_b_connector",
+				Region:                  "us-east-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"USD"},
 				SupportedPaymentMethods: []string{"card"},

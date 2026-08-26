@@ -158,19 +158,34 @@ func isDevelopmentEnvironment(environment string) bool {
 func developmentRoutingConfig() routing.Config {
 	return routing.Config{
 		Policy: routing.Policy{
-			Version:       "local_static_v1",
-			ProviderOrder: []string{"simulator_a", "simulator_b"},
+			Version: "local_static_v2",
+			CandidateOrder: []string{
+				"simulator_a_us_primary",
+				"simulator_a_eu_backup",
+			},
 		},
 		Candidates: []routing.Candidate{
 			{
+				ID:                      "simulator_a_us_primary",
+				ConnectionRevision:      "simulator_a_us_primary_v1",
+				ProviderNamespaceID:     "simulator_a",
 				Provider:                "simulator_a",
+				MerchantAccount:         "merchant_demo_us",
+				Connector:               "simulator",
+				Region:                  "us-east-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"USD", "EUR", "BRL"},
 				SupportedPaymentMethods: []string{"card"},
 				SupportedOperations:     []string{"sale", "authorize"},
 			},
 			{
-				Provider:                "simulator_b",
+				ID:                      "simulator_a_eu_backup",
+				ConnectionRevision:      "simulator_a_eu_backup_v1",
+				ProviderNamespaceID:     "simulator_a",
+				Provider:                "simulator_a",
+				MerchantAccount:         "merchant_demo_eu",
+				Connector:               "simulator",
+				Region:                  "eu-west-1",
 				Enabled:                 true,
 				SupportedCurrencies:     []string{"USD", "EUR", "BRL"},
 				SupportedPaymentMethods: []string{"card"},

@@ -125,7 +125,7 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 	if err != nil {
 		return gateway.Config{}, err
 	}
-	providerSpec, err := requiredSetting(environment, "PROVIDER_ENDPOINTS", "simulator_a=http://127.0.0.1:8083")
+	providerSpec, err := requiredSetting(environment, "PROVIDER_ENDPOINTS", "simulator_a_us_primary=http://127.0.0.1:8083,simulator_a_eu_backup=http://127.0.0.1:8083")
 	if err != nil {
 		return gateway.Config{}, err
 	}
@@ -133,7 +133,31 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 	if err != nil {
 		return gateway.Config{}, fmt.Errorf("PROVIDER_ENDPOINTS: %w", err)
 	}
-	secretSpec, err := requiredSetting(environment, "PROVIDER_WEBHOOK_SECRETS", "simulator_a=dev-webhook-secret")
+	kindSpec, err := requiredSetting(environment, "PROVIDER_CONNECTION_PROVIDERS", "simulator_a_us_primary=simulator_a,simulator_a_eu_backup=simulator_a")
+	if err != nil {
+		return gateway.Config{}, err
+	}
+	providerKinds, err := parseMap(kindSpec)
+	if err != nil {
+		return gateway.Config{}, fmt.Errorf("PROVIDER_CONNECTION_PROVIDERS: %w", err)
+	}
+	revisionSpec, err := requiredSetting(environment, "PROVIDER_CONNECTION_REVISIONS", "simulator_a_us_primary=simulator_a_us_primary_v1,simulator_a_eu_backup=simulator_a_eu_backup_v1")
+	if err != nil {
+		return gateway.Config{}, err
+	}
+	connectionRevisions, err := parseMap(revisionSpec)
+	if err != nil {
+		return gateway.Config{}, fmt.Errorf("PROVIDER_CONNECTION_REVISIONS: %w", err)
+	}
+	namespaceSpec, err := requiredSetting(environment, "PROVIDER_NAMESPACE_IDS", "simulator_a_us_primary=simulator_a,simulator_a_eu_backup=simulator_a")
+	if err != nil {
+		return gateway.Config{}, err
+	}
+	namespaceIDs, err := parseMap(namespaceSpec)
+	if err != nil {
+		return gateway.Config{}, fmt.Errorf("PROVIDER_NAMESPACE_IDS: %w", err)
+	}
+	secretSpec, err := requiredSetting(environment, "PROVIDER_WEBHOOK_SECRETS", "simulator_a_us_primary=dev-webhook-secret,simulator_a_eu_backup=dev-webhook-secret")
 	if err != nil {
 		return gateway.Config{}, err
 	}
@@ -141,6 +165,11 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 	if err != nil {
 		return gateway.Config{}, fmt.Errorf("PROVIDER_WEBHOOK_SECRETS: %w", err)
 	}
+	recoveryAliases, err := parseOptionalMap(os.Getenv("PROVIDER_RECOVERY_ALIASES"))
+	if err != nil {
+		return gateway.Config{}, fmt.Errorf("PROVIDER_RECOVERY_ALIASES: %w", err)
+	}
+	addLegacyDevelopmentConnections(environment, providers, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases)
 	webhookBaseURL, err := requiredSetting(environment, "GATEWAY_WEBHOOK_BASE_URL", "http://127.0.0.1:8082")
 	if err != nil {
 		return gateway.Config{}, err
@@ -150,14 +179,55 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 		return gateway.Config{}, err
 	}
 	return gateway.Config{
-		Environment:       environment,
-		ProviderEndpoints: providers,
-		WebhookBaseURL:    webhookBaseURL,
-		WebhookSecrets:    secrets,
-		ProviderTimeout:   durationEnv("PROVIDER_REQUEST_TIMEOUT", 750*time.Millisecond),
-		PaymentOutcomeURL: paymentOutcomeURL,
-		InternalToken:     internalToken,
+		Environment:                 environment,
+		ProviderKinds:               providerKinds,
+		ProviderConnectionRevisions: connectionRevisions,
+		ProviderNamespaceIDs:        namespaceIDs,
+		ProviderRecoveryAliases:     recoveryAliases,
+		ProviderEndpoints:           providers,
+		WebhookBaseURL:              webhookBaseURL,
+		WebhookSecrets:              secrets,
+		ProviderTimeout:             durationEnv("PROVIDER_REQUEST_TIMEOUT", 750*time.Millisecond),
+		PaymentOutcomeURL:           paymentOutcomeURL,
+		InternalToken:               internalToken,
 	}, nil
+}
+
+func addLegacyDevelopmentConnections(environment string, endpoints, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases map[string]string) {
+	if !gateway.IsDevelopmentEnvironment(environment) {
+		return
+	}
+	const (
+		legacyConnection  = "simulator_a"
+		primaryConnection = "simulator_a_us_primary"
+		providerKind      = "simulator_a"
+	)
+	endpoint, endpointOK := endpoints[primaryConnection]
+	secret, secretOK := secrets[primaryConnection]
+	if !endpointOK || !secretOK || providerKinds[primaryConnection] != providerKind || namespaceIDs[primaryConnection] != providerKind {
+		return
+	}
+	// 0002 can only recover the historical provider string as a connection ID.
+	// Keep that exact local/test alias resolvable while legacy UNKNOWN operations
+	// and their previously issued webhook URLs drain.
+	if _, exists := endpoints[legacyConnection]; !exists {
+		endpoints[legacyConnection] = endpoint
+	}
+	if _, exists := providerKinds[legacyConnection]; !exists {
+		providerKinds[legacyConnection] = providerKind
+	}
+	if _, exists := connectionRevisions[legacyConnection]; !exists {
+		connectionRevisions[legacyConnection] = "legacy_v1"
+	}
+	if _, exists := namespaceIDs[legacyConnection]; !exists {
+		namespaceIDs[legacyConnection] = providerKind
+	}
+	if _, exists := secrets[legacyConnection]; !exists {
+		secrets[legacyConnection] = secret
+	}
+	if _, exists := recoveryAliases[legacyConnection]; !exists {
+		recoveryAliases[legacyConnection] = primaryConnection
+	}
 }
 
 func requiredSetting(environment, name, developmentDefault string) (string, error) {
@@ -188,4 +258,11 @@ func parseMap(value string) (map[string]string, error) {
 		return nil, errors.New("at least one key=value entry is required")
 	}
 	return result, nil
+}
+
+func parseOptionalMap(value string) (map[string]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return map[string]string{}, nil
+	}
+	return parseMap(value)
 }

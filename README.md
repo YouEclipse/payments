@@ -18,6 +18,7 @@
 - 客户端重试依靠持久化幂等键收敛，不能制造第二次扣款。
 - provider 响应丢失时进入 `UNKNOWN`，先查询或对账，禁止盲目切换 provider。
 - 授权与失败证据冲突、Provider reference 碰撞等矛盾事实进入 `review_required`，停止自动恢复并写入运营 outbox，而不是用最后到达的事件覆盖资金事实。
+- Router 返回稳定 `candidate_id`、不可变 `connection_revision` 与 `provider_namespace_id`；Payment 与 Gateway 持久化相同执行身份。UNKNOWN 查询与同键重送固定原 connection/revision，reference/event 碰撞按共享 namespace 检测，recovery alias 不能绕过它。Gateway 的 revision registry 拒绝相同 ID/revision 重绑执行配置。
 - PostgreSQL 是第一阶段唯一的权威状态源；不引入 Redis 或消息 broker。
 - 服务之间通过稳定契约通信；payment 与 provider-gateway 只能访问各自拥有的 schema，禁止跨服务读表。
 - 系统只处理 tokenized payment method；日志、事件和指标不得包含 PAN、CVV 或密钥。
@@ -41,7 +42,13 @@ make compose-up
 | simulator | `http://localhost:8083` |
 | PostgreSQL | `localhost:5432` |
 
-每个 HTTP 服务提供 `/livez` 和 `/readyz`；Compose 使用 readiness 检查决定依赖服务何时可以接收请求。需要停止服务时执行：
+每个 HTTP 服务提供 `/livez` 和 `/readyz`；Compose 使用 readiness 检查决定依赖服务何时可以接收请求。
+
+本地 Gateway 仍注册旧的 `simulator_a` connection，专门恢复升级前已经持久化的 operation、outbox 与 webhook；Router 不会选择该 alias，Gateway 也拒绝用它创建新 operation。它与 canonical connection 共享 `simulator_a` namespace，但只有显式 `PROVIDER_RECOVERY_ALIASES` 才授权 webhook 跨路径关联。保留原连接、revision 和认证材料，直到非终态 operation、待投递事件及约定的迟到事件窗口排空；Gateway readiness 会在非终态 tuple 无法解析或同 revision 配置重绑时失败。完整约束见 [ADR 0002](docs/adr/0002-immutable-provider-connections.md)。
+
+`payment` 的 `003` 与 `provider-gateway` 的 `0002` 是一次协调升级，不支持 rolling 或 zero-downtime 部署。执行迁移前必须停止接收新的 Confirm，先让所有非终态 operation 完成查询、对账或人工接管，再停止全部旧版 Payment/Gateway 进程并备份数据库；只有这些门禁都满足后，才能执行迁移并启动新版本。无法满足时不得提前应用这两份迁移，否则旧 binary 会继续写入 v1 结构并失败。
+
+需要停止本地服务时执行：
 
 ```bash
 make compose-down
@@ -110,6 +117,6 @@ make ci
 
 当前纵向切片只支持一次性 tokenized card 与 `capture_method=automatic`，其初始资金操作是单个 `SALE`。手动 Capture、Void、Refund、3DS、真实 PSP connector、账务台账与清结算会随本书后续章节逐步加入。
 
-CI 会用真实 PostgreSQL 启动四个容器，覆盖同步成功、明确拒绝、响应丢失后安全收敛、商户幂等，以及 UNKNOWN 场景只有一条 Attempt/Provider Operation 资金路径。测试中的 provider 仍然是 simulator。
+CI 会用真实 PostgreSQL 启动四个容器，覆盖同步成功、明确拒绝、响应丢失后安全收敛、商户幂等，以及 UNKNOWN 场景只有一条 Attempt/Provider Operation 资金路径。Router 的本地配置包含同一 simulator provider 的两个独立 connection，用于证明恢复不会漂移到备用账户或区域；外部 provider 仍然只是 simulator。
 
 这个仓库是教学实现，也会尽量保留生产支付系统真正重要的语义。它不是经过 PCI DSS 认证的即用型支付产品；接入真实资金前仍需完成安全评审、合规认证、密钥管理、灾备和运营控制。

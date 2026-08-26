@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Provider Gateway Internal API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Internal provider-operation and signed-webhook contract. Merchant API keys
     and raw card data are forbidden; callers submit tokenized payment methods.
@@ -19,11 +19,11 @@ paths:
   /readyz:
     get:
       operationId: getProviderGatewayReadiness
-      summary: Report persistence readiness
+      summary: Report persistence and durable connection readiness
       security: []
       responses:
         "204":
-          description: Required persistence is available.
+          description: Required persistence is available, every nonterminal operation resolves to its exact connection tuple, and configured execution fingerprints match the immutable connection-revision registry.
         "503":
           $ref: "#/components/responses/ErrorResponse"
   /metrics:
@@ -42,7 +42,7 @@ paths:
     post:
       operationId: executeProviderOperation
       summary: Execute one logical provider operation
-      description: Reusing operation_id is idempotent only when every semantic request field is identical.
+      description: Reusing operation_id is idempotent only when every semantic request field and the exact provider connection identity tuple are identical. Recovery-only aliases can resume existing operations but cannot create new ones.
       security:
         - InternalServiceToken: []
       requestBody:
@@ -69,9 +69,17 @@ paths:
         "401":
           $ref: "#/components/responses/ErrorResponse"
         "409":
-          $ref: "#/components/responses/ErrorResponse"
+          description: operation_id_reused rejects semantic or identity drift; provider_connection_identity_mismatch rejects an unresolved durable connection revision. Automated resubmission must stop for review.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "422":
-          $ref: "#/components/responses/ErrorResponse"
+          description: Invalid request or a recovery-only alias used for a new operation. provider_connection_identity_mismatch identifies a request tuple that does not match configured execution identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "503":
           $ref: "#/components/responses/ErrorResponse"
   /internal/v1/provider-operations/{operation_id}:
@@ -85,7 +93,7 @@ paths:
         - in: query
           name: reconcile
           description: |
-            Reconcile a nonterminal operation against the same provider. A
+            Reconcile a nonterminal operation against the same provider connection. A
             durable operation that was never dispatched may return the
             operation_resubmit_required recovery signal so the caller can
             resubmit the identical request with the same operation ID.
@@ -103,17 +111,28 @@ paths:
           $ref: "#/components/responses/ErrorResponse"
         "404":
           $ref: "#/components/responses/ErrorResponse"
+        "409":
+          description: The durable operation's connection identity cannot be resolved exactly; error.code is provider_connection_identity_mismatch and automated resubmission must stop for review.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
         "500":
           $ref: "#/components/responses/ErrorResponse"
-  /webhooks/{provider}:
+  /webhooks/{provider_connection_id}:
     post:
       operationId: ingestProviderWebhook
       summary: Receive a signed provider event
-      description: The event is durably deduplicated before acknowledgement and delivered through the gateway outbox.
+      description: |
+        Events are durably deduplicated within provider_namespace_id and delivered
+        through the gateway outbox. The path selects authentication configuration;
+        the matched operation's durable identity tuple is used in persisted events
+        and outcomes. Only explicit recovery aliases may authorize another
+        connection; a shared provider namespace alone grants no such authority.
       security: []
       parameters:
         - in: path
-          name: provider
+          name: provider_connection_id
           required: true
           schema:
             type: string
@@ -169,6 +188,9 @@ components:
       required:
         - operation_id
         - attempt_id
+        - provider_connection_id
+        - provider_connection_revision
+        - provider_namespace_id
         - provider
         - amount_minor
         - currency
@@ -181,6 +203,18 @@ components:
         attempt_id:
           type: string
           minLength: 1
+        provider_connection_id:
+          type: string
+          minLength: 1
+          description: Stable Router candidate ID pinning provider account, connector, and region.
+        provider_connection_revision:
+          type: string
+          minLength: 1
+          description: Immutable registered execution-configuration revision used for every retry and reconciliation. Reusing a revision with a different execution fingerprint is rejected.
+        provider_namespace_id:
+          type: string
+          minLength: 1
+          description: Conservative provider-side idempotency, event, and reference collision domain. Recovery aliases share this value; it is not a webhook authorization domain.
         provider:
           type: string
           minLength: 1
@@ -208,6 +242,9 @@ components:
       required:
         - operation_id
         - attempt_id
+        - provider_connection_id
+        - provider_connection_revision
+        - provider_namespace_id
         - provider
         - provider_idempotency_key
         - status
@@ -219,6 +256,18 @@ components:
           type: string
         attempt_id:
           type: string
+        provider_connection_id:
+          type: string
+          minLength: 1
+          description: Exact connection used for every dispatch and reconciliation of this operation.
+        provider_connection_revision:
+          type: string
+          minLength: 1
+          description: Exact immutable connection revision used for dispatch and reconciliation.
+        provider_namespace_id:
+          type: string
+          minLength: 1
+          description: Durable provider-side collision domain used for provider event and reference correlation.
         provider:
           type: string
         provider_idempotency_key:
@@ -250,7 +299,7 @@ components:
         provider:
           type: string
           minLength: 1
-          description: Must equal the provider path parameter.
+          description: Must equal the provider kind configured for the path's provider_connection_id.
         operation_id:
           type: string
           minLength: 1

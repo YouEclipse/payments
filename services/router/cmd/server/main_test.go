@@ -56,8 +56,8 @@ func TestLoadRoutingConfigUsesDevelopmentDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadRoutingConfig() error = %v", err)
 	}
-	if config.Policy.Version != "local_static_v1" {
-		t.Fatalf("policy version = %q, want local_static_v1", config.Policy.Version)
+	if config.Policy.Version != "local_static_v2" {
+		t.Fatalf("policy version = %q, want local_static_v2", config.Policy.Version)
 	}
 	if len(config.Candidates) != 2 || config.Candidates[0].Provider != "simulator_a" {
 		t.Fatalf("development candidates = %#v", config.Candidates)
@@ -71,9 +71,15 @@ func TestLoadRoutingConfigParsesExplicitPolicy(t *testing.T) {
 	t.Parallel()
 
 	raw := `{
-		"policy":{"version":"production_v1","provider_order":["provider_a"]},
+		"policy":{"version":"production_v1","candidate_order":["provider_a_us_primary"]},
 		"candidates":[{
+			"candidate_id":"provider_a_us_primary",
+			"connection_revision":"provider_a_us_primary_v1",
+			"provider_namespace_id":"provider_a",
 			"provider":"provider_a",
+			"merchant_account":"acct_us",
+			"connector":"provider_a_connector",
+			"region":"us-east-1",
 			"enabled":true,
 			"supported_currencies":["USD"],
 			"supported_payment_methods":["card"],
@@ -92,7 +98,7 @@ func TestLoadRoutingConfigParsesExplicitPolicy(t *testing.T) {
 func TestLoadRoutingConfigRejectsUnknownFields(t *testing.T) {
 	t.Parallel()
 
-	raw := `{"policy":{"version":"v1","provider_order":["provider_a"],"token":"secret"},"candidates":[]}`
+	raw := `{"policy":{"version":"v1","candidate_order":["provider_a"],"token":"secret"},"candidates":[]}`
 	_, err := loadRoutingConfig("test", raw)
 	if err == nil || !strings.Contains(err.Error(), "unknown field") {
 		t.Fatalf("loadRoutingConfig() error = %v, want unknown-field error", err)

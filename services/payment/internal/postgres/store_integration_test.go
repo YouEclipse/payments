@@ -5,12 +5,14 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/YouEclipse/payments/services/payment/internal/domain"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,6 +22,9 @@ func TestApplyOutcomeCompletesConfirmationIdempotencyAtomically(t *testing.T) {
 
 	result, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
 		EventID:                    "evt_atomic_" + aggregate.Operation.ID,
+		ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
 		Provider:                   aggregate.Operation.Provider,
 		OperationID:                aggregate.Operation.ID,
 		ProviderIdempotencyKey:     aggregate.Operation.ProviderIdempotencyKey,
@@ -45,14 +50,17 @@ func TestApplyOutcomeCompletesConfirmationIdempotencyAtomically(t *testing.T) {
 	}
 }
 
-func TestDuplicateInboxCorrelationCannotCompleteIncomingPayment(t *testing.T) {
+func TestDuplicateInboxNamespaceCorrelationCannotCompleteIncomingPayment(t *testing.T) {
 	store, pool, ctx := integrationStore(t)
 	first, _, _ := prepareIntegrationAggregate(t, ctx, store, "duplicate_a", true)
-	second, secondMerchant, secondKey := prepareIntegrationAggregate(t, ctx, store, "duplicate_b", true)
+	second, secondMerchant, secondKey := prepareIntegrationAggregateWithConnection(t, ctx, store, "duplicate_b", true, "provider_integration_eu_backup")
 	eventID := "evt_shared_" + first.Operation.ID
 
 	if _, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
 		EventID:                    eventID,
+		ProviderConnectionID:       first.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: first.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        first.Operation.ProviderNamespaceID,
 		Provider:                   first.Operation.Provider,
 		OperationID:                first.Operation.ID,
 		ProviderIdempotencyKey:     first.Operation.ProviderIdempotencyKey,
@@ -65,13 +73,16 @@ func TestDuplicateInboxCorrelationCannotCompleteIncomingPayment(t *testing.T) {
 	}
 
 	duplicate, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
-		EventID:                  eventID,
-		Provider:                 first.Operation.Provider,
-		OperationID:              second.Operation.ID,
-		ProviderIdempotencyKey:   second.Operation.ProviderIdempotencyKey,
-		Status:                   domain.OutcomeSucceeded,
-		SideEffectCertainty:      domain.SideEffectConfirmed,
-		ProviderPaymentReference: "psp_payment_" + second.Operation.ID,
+		EventID:                    eventID,
+		ProviderConnectionID:       second.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: second.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        second.Operation.ProviderNamespaceID,
+		Provider:                   second.Operation.Provider,
+		OperationID:                second.Operation.ID,
+		ProviderIdempotencyKey:     second.Operation.ProviderIdempotencyKey,
+		Status:                     domain.OutcomeSucceeded,
+		SideEffectCertainty:        domain.SideEffectConfirmed,
+		ProviderPaymentReference:   "psp_payment_" + second.Operation.ID,
 	}, []byte(`{"event":"collision"}`), time.Now().UTC(), integrationResponseBuilder)
 	if err != nil || !duplicate.Duplicate || !duplicate.Rejected {
 		t.Fatalf("correlation collision: result=%+v err=%v", duplicate, err)
@@ -93,7 +104,7 @@ func TestDuplicateInboxCorrelationCannotCompleteIncomingPayment(t *testing.T) {
 	var quarantined int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM provider_outcome_quarantine
-		WHERE provider=$1 AND event_id=$2`, first.Operation.Provider, eventID,
+		WHERE provider_namespace_id=$1 AND event_id=$2`, first.Operation.ProviderNamespaceID, eventID,
 	).Scan(&quarantined); err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +118,9 @@ func TestDuplicateInboxEventRejectsChangedPayloadWithSameCorrelation(t *testing.
 	aggregate, _, _ := prepareIntegrationAggregate(t, ctx, store, "duplicate_payload", true)
 	eventID := "evt_payload_" + aggregate.Operation.ID
 	outcome := domain.ProviderOutcome{
-		EventID: eventID, Provider: aggregate.Operation.Provider, OperationID: aggregate.Operation.ID,
+		EventID: eventID, ProviderConnectionID: aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision, ProviderNamespaceID: aggregate.Operation.ProviderNamespaceID,
+		Provider: aggregate.Operation.Provider, OperationID: aggregate.Operation.ID,
 		ProviderIdempotencyKey: aggregate.Operation.ProviderIdempotencyKey,
 		Status:                 domain.OutcomeUnknown, SideEffectCertainty: domain.SideEffectPossible,
 	}
@@ -121,7 +134,7 @@ func TestDuplicateInboxEventRejectsChangedPayloadWithSameCorrelation(t *testing.
 	var quarantined int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM provider_outcome_quarantine
-		WHERE provider=$1 AND event_id=$2`, aggregate.Operation.Provider, eventID,
+		WHERE provider_namespace_id=$1 AND event_id=$2`, aggregate.Operation.ProviderNamespaceID, eventID,
 	).Scan(&quarantined); err != nil {
 		t.Fatal(err)
 	}
@@ -136,13 +149,16 @@ func TestRejectedOutcomeIsDurablyQuarantinedWithoutCompletingCommand(t *testing.
 	eventID := "evt_rejected_" + aggregate.Operation.ID
 
 	result, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
-		EventID:                  eventID,
-		Provider:                 "wrong_provider",
-		OperationID:              aggregate.Operation.ID,
-		ProviderIdempotencyKey:   aggregate.Operation.ProviderIdempotencyKey,
-		Status:                   domain.OutcomeSucceeded,
-		SideEffectCertainty:      domain.SideEffectConfirmed,
-		ProviderPaymentReference: "psp_wrong_" + aggregate.Operation.ID,
+		EventID:                    eventID,
+		ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+		Provider:                   "wrong_provider",
+		OperationID:                aggregate.Operation.ID,
+		ProviderIdempotencyKey:     aggregate.Operation.ProviderIdempotencyKey,
+		Status:                     domain.OutcomeSucceeded,
+		SideEffectCertainty:        domain.SideEffectConfirmed,
+		ProviderPaymentReference:   "psp_wrong_" + aggregate.Operation.ID,
 	}, []byte(`{"event":"wrong-provider"}`), time.Now().UTC(), integrationResponseBuilder)
 	if err != nil || !result.Rejected || result.Duplicate {
 		t.Fatalf("reject outcome: result=%+v err=%v", result, err)
@@ -151,7 +167,7 @@ func TestRejectedOutcomeIsDurablyQuarantinedWithoutCompletingCommand(t *testing.
 	var processingStatus, rejectionReason string
 	if err := pool.QueryRow(ctx, `
 		SELECT processing_status,rejection_reason FROM provider_outcome_inbox
-		WHERE provider=$1 AND event_id=$2`, "wrong_provider", eventID,
+		WHERE provider_namespace_id=$1 AND event_id=$2`, aggregate.Operation.ProviderNamespaceID, eventID,
 	).Scan(&processingStatus, &rejectionReason); err != nil {
 		t.Fatal(err)
 	}
@@ -175,6 +191,9 @@ func TestProviderReferenceCollisionIsQuarantinedInsteadOfAbortingInbox(t *testin
 
 	if _, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
 		EventID:                    "evt_reference_a_" + first.Operation.ID,
+		ProviderConnectionID:       first.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: first.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        first.Operation.ProviderNamespaceID,
 		Provider:                   first.Operation.Provider,
 		OperationID:                first.Operation.ID,
 		Status:                     domain.OutcomeSucceeded,
@@ -187,6 +206,9 @@ func TestProviderReferenceCollisionIsQuarantinedInsteadOfAbortingInbox(t *testin
 	eventID := "evt_reference_b_" + second.Operation.ID
 	collision, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
 		EventID:                    eventID,
+		ProviderConnectionID:       second.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: second.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        second.Operation.ProviderNamespaceID,
 		Provider:                   second.Operation.Provider,
 		OperationID:                second.Operation.ID,
 		Status:                     domain.OutcomeSucceeded,
@@ -200,7 +222,7 @@ func TestProviderReferenceCollisionIsQuarantinedInsteadOfAbortingInbox(t *testin
 	var processingStatus, commandState string
 	if err := pool.QueryRow(ctx, `
 		SELECT processing_status FROM provider_outcome_inbox
-		WHERE provider=$1 AND event_id=$2`, second.Operation.Provider, eventID,
+		WHERE provider_namespace_id=$1 AND event_id=$2`, second.Operation.ProviderNamespaceID, eventID,
 	).Scan(&processingStatus); err != nil {
 		t.Fatal(err)
 	}
@@ -296,7 +318,9 @@ func TestRepeatedUnknownDoesNotEmitFalsePaymentStatusEvents(t *testing.T) {
 		t.Fatal(err)
 	}
 	first, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
-		EventID: "evt_unknown_first_" + aggregate.Operation.ID, Provider: aggregate.Operation.Provider,
+		EventID: "evt_unknown_first_" + aggregate.Operation.ID, ProviderConnectionID: aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision, ProviderNamespaceID: aggregate.Operation.ProviderNamespaceID,
+		Provider:    aggregate.Operation.Provider,
 		OperationID: aggregate.Operation.ID, Status: domain.OutcomeUnknown,
 		SideEffectCertainty: domain.SideEffectPossible,
 	}, []byte(`{"event":"unknown-first"}`), time.Now().UTC(), integrationResponseBuilder)
@@ -304,7 +328,9 @@ func TestRepeatedUnknownDoesNotEmitFalsePaymentStatusEvents(t *testing.T) {
 		t.Fatalf("first UNKNOWN: result=%+v err=%v", first, err)
 	}
 	second, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
-		EventID: "evt_unknown_second_" + aggregate.Operation.ID, Provider: aggregate.Operation.Provider,
+		EventID: "evt_unknown_second_" + aggregate.Operation.ID, ProviderConnectionID: aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision, ProviderNamespaceID: aggregate.Operation.ProviderNamespaceID,
+		Provider:    aggregate.Operation.Provider,
 		OperationID: aggregate.Operation.ID, Status: domain.OutcomeUnknown,
 		SideEffectCertainty: domain.SideEffectPossible,
 	}, []byte(`{"event":"unknown-second"}`), time.Now().UTC().Add(time.Second), integrationResponseBuilder)
@@ -328,6 +354,82 @@ func TestRepeatedUnknownDoesNotEmitFalsePaymentStatusEvents(t *testing.T) {
 	}
 }
 
+func TestProviderReferenceCollisionSpansAliasesInTheSameNamespace(t *testing.T) {
+	store, _, ctx := integrationStore(t)
+	first, _, _ := prepareIntegrationAggregateWithConnection(t, ctx, store, "connection_scope_a", true, "provider_integration_us_primary")
+	second, _, _ := prepareIntegrationAggregateWithConnection(t, ctx, store, "connection_scope_b", true, "provider_integration_eu_backup")
+	sharedReference := "provider_namespace_reference_" + first.Operation.ID
+
+	for index, aggregate := range []Aggregate{first, second} {
+		result, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
+			EventID:                    fmt.Sprintf("evt_connection_scope_%d_%s", index, aggregate.Operation.ID),
+			ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+			ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+			ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+			Provider:                   aggregate.Operation.Provider,
+			OperationID:                aggregate.Operation.ID,
+			ProviderIdempotencyKey:     aggregate.Operation.ProviderIdempotencyKey,
+			Status:                     domain.OutcomeSucceeded,
+			SideEffectCertainty:        domain.SideEffectConfirmed,
+			ProviderPaymentReference:   sharedReference,
+			ProviderOperationReference: sharedReference,
+		}, []byte(fmt.Sprintf(`{"connection":%d}`, index)), time.Now().UTC(), integrationResponseBuilder)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if index == 0 && (result.Rejected || result.Aggregate.Intent.Status != domain.IntentSucceeded) {
+			t.Fatalf("first namespace owner result=%+v", result)
+		}
+		if index == 1 && (!result.Rejected || result.Aggregate.Intent.IntegrityStatus != domain.IntegrityReviewRequired) {
+			t.Fatalf("alias escaped namespace collision detection: %+v", result)
+		}
+	}
+	firstOwner, err := store.GetAggregateByOperation(ctx, first.Operation.ID)
+	if err != nil || firstOwner.Intent.IntegrityStatus != domain.IntegrityReviewRequired {
+		t.Fatalf("original namespace owner was not placed in review: %+v err=%v", firstOwner, err)
+	}
+}
+
+func TestProviderReferencesMayRepeatAcrossDistinctNamespaces(t *testing.T) {
+	store, _, ctx := integrationStore(t)
+	first, _, _ := prepareIntegrationAggregateWithIdentity(t, ctx, store, "namespace_a", true, "provider_us", "provider_account_us")
+	second, _, _ := prepareIntegrationAggregateWithIdentity(t, ctx, store, "namespace_b", true, "provider_eu", "provider_account_eu")
+	sharedReference := "account_local_reference_" + first.Operation.ID
+	for index, aggregate := range []Aggregate{first, second} {
+		result, err := store.ApplyOutcome(ctx, domain.ProviderOutcome{
+			EventID:                    fmt.Sprintf("evt_namespace_%d_%s", index, aggregate.Operation.ID),
+			ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+			ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+			ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+			Provider:                   aggregate.Operation.Provider,
+			OperationID:                aggregate.Operation.ID,
+			Status:                     domain.OutcomeSucceeded,
+			SideEffectCertainty:        domain.SideEffectConfirmed,
+			ProviderPaymentReference:   sharedReference,
+			ProviderOperationReference: sharedReference,
+		}, []byte(fmt.Sprintf(`{"namespace":%d}`, index)), time.Now().UTC(), integrationResponseBuilder)
+		if err != nil || result.Rejected || result.Aggregate.Intent.Status != domain.IntentSucceeded {
+			t.Fatalf("distinct namespace was falsely collided: result=%+v err=%v", result, err)
+		}
+	}
+}
+
+func TestDatabaseRejectsOperationExecutionIdentityDrift(t *testing.T) {
+	store, pool, ctx := integrationStore(t)
+	aggregate, _, _ := prepareIntegrationAggregate(t, ctx, store, "identity_fk", false)
+	_, err := pool.Exec(ctx, `
+		UPDATE provider_operations SET provider_connection_revision='rebound_v2' WHERE id=$1`, aggregate.Operation.ID,
+	)
+	var constraintError *pgconn.PgError
+	if !errors.As(err, &constraintError) || constraintError.Code != "23503" {
+		t.Fatalf("identity drift error=%v, want foreign-key violation", err)
+	}
+	stored, err := store.GetAggregateByOperation(ctx, aggregate.Operation.ID)
+	if err != nil || stored.Operation.ProviderConnectionRevision != aggregate.Operation.ProviderConnectionRevision {
+		t.Fatalf("rejected identity drift changed the durable operation: %+v err=%v", stored, err)
+	}
+}
+
 func integrationStore(t *testing.T) (*Store, *pgxpool.Pool, context.Context) {
 	t.Helper()
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
@@ -348,6 +450,14 @@ func integrationStore(t *testing.T) (*Store, *pgxpool.Pool, context.Context) {
 }
 
 func prepareIntegrationAggregate(t *testing.T, ctx context.Context, store *Store, label string, markSending bool) (Aggregate, string, string) {
+	return prepareIntegrationAggregateWithConnection(t, ctx, store, label, markSending, "provider_integration_us_primary")
+}
+
+func prepareIntegrationAggregateWithConnection(t *testing.T, ctx context.Context, store *Store, label string, markSending bool, providerConnectionID string) (Aggregate, string, string) {
+	return prepareIntegrationAggregateWithIdentity(t, ctx, store, label, markSending, providerConnectionID, "provider_integration")
+}
+
+func prepareIntegrationAggregateWithIdentity(t *testing.T, ctx context.Context, store *Store, label string, markSending bool, providerConnectionID, providerNamespaceID string) (Aggregate, string, string) {
 	t.Helper()
 	suffix := fmt.Sprintf("%s_%d", label, time.Now().UnixNano())
 	now := time.Now().UTC()
@@ -365,12 +475,15 @@ func prepareIntegrationAggregate(t *testing.T, ctx context.Context, store *Store
 	}
 	attempt := domain.PaymentAttempt{
 		ID: "att_" + suffix, PaymentIntentID: intent.ID, AttemptNumber: 1,
-		RoutingDecisionID: "route_" + suffix, Provider: "provider_integration", CreatedAt: now, UpdatedAt: now,
+		RoutingDecisionID: "route_" + suffix, ProviderConnectionID: providerConnectionID,
+		ProviderConnectionRevision: providerConnectionID + "_v1", ProviderNamespaceID: providerNamespaceID,
+		Provider: "provider_integration", CreatedAt: now, UpdatedAt: now,
 	}
 	operation := domain.ProviderOperation{
 		ID: "op_" + suffix, PaymentIntentID: intent.ID, PaymentAttemptID: attempt.ID,
 		Kind: domain.OperationSale, AmountMinor: intent.AmountMinor, Currency: intent.Currency,
-		Provider: attempt.Provider, ProviderIdempotencyKey: "op_" + suffix,
+		ProviderConnectionID: attempt.ProviderConnectionID, Provider: attempt.Provider, ProviderIdempotencyKey: "op_" + suffix,
+		ProviderConnectionRevision: attempt.ProviderConnectionRevision, ProviderNamespaceID: attempt.ProviderNamespaceID,
 		MerchantReference: "op_" + suffix, RequestHash: []byte("provider_hash_" + suffix),
 		CreatedAt: now, UpdatedAt: now,
 	}

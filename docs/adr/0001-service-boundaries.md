@@ -25,6 +25,8 @@ Router 是纯决策边界。它接收 routing context，执行硬约束并返回
 
 Provider-gateway 是内部集成边界。它负责 provider-specific 协议、认证、请求映射和错误归一化，但不选择路由、不保存 Payment Intent 状态，也不能把网络错误自行解释成资金失败。它拥有自己的 operation、webhook inbox 与 outbox schema，以保证 provider 请求和回调幂等。
 
+Router 返回的 `candidate_id` 是精确 Provider Connection 身份，包含 Provider、Merchant Account、Connector 与 Region 的绑定。Payment 与 Provider Gateway 持久化同一个 `provider_connection_id`、不可变 revision 和 provider namespace；Provider 名称只选择 adapter kind。retry/query 固定 exact connection/revision，外部 reference/event collision 按共享 namespace 检测，webhook 认证仍按连接与显式 recovery alias 授权，详见 [ADR 0002](0002-immutable-provider-connections.md)。
+
 ### Simulator 边界
 
 Simulator 实现 provider 测试契约，用于本地开发和 CI。它必须拒绝 live/production 环境，不能读取真实 provider 凭证，也不能作为真实路由候选部署。

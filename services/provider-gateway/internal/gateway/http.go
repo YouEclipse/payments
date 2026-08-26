@@ -25,7 +25,7 @@ func NewHTTPHandler(service *Service, store Store, internalToken string) http.Ha
 	})
 	mux.Handle("POST /internal/v1/provider-operations", h.requireInternal(http.HandlerFunc(h.execute)))
 	mux.Handle("GET /internal/v1/provider-operations/{operation_id}", h.requireInternal(http.HandlerFunc(h.get)))
-	mux.HandleFunc("POST /webhooks/{provider}", h.webhook)
+	mux.HandleFunc("POST /webhooks/{provider_connection_id}", h.webhook)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
@@ -34,8 +34,8 @@ func NewHTTPHandler(service *Service, store Store, internalToken string) http.Ha
 }
 
 func (h *HTTPHandler) ready(w http.ResponseWriter, r *http.Request) {
-	if err := h.store.Ping(r.Context()); err != nil {
-		writeError(w, http.StatusServiceUnavailable, "not_ready", "required storage is unavailable")
+	if err := h.service.Ready(r.Context()); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "not_ready", "required storage or immutable provider connection configuration is unavailable")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
@@ -52,6 +52,10 @@ func (h *HTTPHandler) execute(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errors.Is(err, ErrIdempotencyConflict):
 			writeError(w, http.StatusConflict, "operation_id_reused", err.Error())
+		case errors.Is(err, ErrUnconfiguredConnection), errors.Is(err, ErrConnectionRevisionConflict):
+			writeError(w, http.StatusConflict, "provider_connection_identity_mismatch", err.Error())
+		case errors.Is(err, ErrProviderConnectionIdentityMismatch):
+			writeError(w, http.StatusUnprocessableEntity, "provider_connection_identity_mismatch", err.Error())
 		case errors.Is(err, ErrInvalidOperation):
 			writeError(w, http.StatusUnprocessableEntity, "operation_rejected", err.Error())
 		default:
@@ -69,6 +73,10 @@ func (h *HTTPHandler) execute(w http.ResponseWriter, r *http.Request) {
 func (h *HTTPHandler) get(w http.ResponseWriter, r *http.Request) {
 	reconcile := r.URL.Query().Get("reconcile") == "true"
 	op, err := h.service.Get(r.Context(), r.PathValue("operation_id"), reconcile)
+	if errors.Is(err, ErrUnconfiguredConnection) || errors.Is(err, ErrConnectionRevisionConflict) {
+		writeError(w, http.StatusConflict, "provider_connection_identity_mismatch", err.Error())
+		return
+	}
 	if errors.Is(err, ErrResubmitRequired) {
 		// Payment owns the original tokenized request payload. A 404 on the
 		// reconcile form tells it to resubmit that exact operation; Execute then
@@ -93,7 +101,7 @@ func (h *HTTPHandler) webhook(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_webhook", "webhook body is too large or unreadable")
 		return
 	}
-	_, err = h.service.ApplyWebhook(r.Context(), r.PathValue("provider"), body, r.Header.Get("X-Provider-Signature"))
+	_, err = h.service.ApplyWebhook(r.Context(), r.PathValue("provider_connection_id"), body, r.Header.Get("X-Provider-Signature"))
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrInvalidWebhook):

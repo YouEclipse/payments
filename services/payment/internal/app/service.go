@@ -22,7 +22,7 @@ type Router interface {
 
 type Gateway interface {
 	Execute(context.Context, clients.GatewayOperationRequest) (domain.ProviderOutcome, error)
-	Query(context.Context, string) (domain.ProviderOutcome, error)
+	Query(context.Context, clients.GatewayOperationIdentity) (domain.ProviderOutcome, error)
 }
 
 type Service struct {
@@ -176,13 +176,16 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 	}
 
 	gatewayCommand := clients.GatewayOperationRequest{
-		OperationID:        operationID,
-		AttemptID:          attemptID,
-		Provider:           decision.SelectedProvider,
-		AmountMinor:        intent.AmountMinor,
-		Currency:           intent.Currency,
-		PaymentMethodToken: intent.PaymentMethodToken,
-		CaptureMethod:      string(intent.CaptureMethod),
+		OperationID:                operationID,
+		AttemptID:                  attemptID,
+		ProviderConnectionID:       decision.SelectedCandidate.CandidateID,
+		ProviderConnectionRevision: decision.SelectedCandidate.ConnectionRevision,
+		ProviderNamespaceID:        decision.SelectedCandidate.ProviderNamespaceID,
+		Provider:                   decision.SelectedCandidate.Provider,
+		AmountMinor:                intent.AmountMinor,
+		Currency:                   intent.Currency,
+		PaymentMethodToken:         intent.PaymentMethodToken,
+		CaptureMethod:              string(intent.CaptureMethod),
 	}
 	providerPayload, err := json.Marshal(gatewayCommand)
 	if err != nil {
@@ -196,28 +199,34 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 		RequestHash:    requestHash,
 		Now:            now,
 		Attempt: domain.PaymentAttempt{
-			ID:                 attemptID,
-			PaymentIntentID:    intent.ID,
-			AttemptNumber:      1,
-			RoutingDecisionID:  decision.DecisionID,
-			Provider:           decision.SelectedProvider,
-			RerouteDisposition: domain.RerouteBlocked,
-			CreatedAt:          now,
-			UpdatedAt:          now,
+			ID:                         attemptID,
+			PaymentIntentID:            intent.ID,
+			AttemptNumber:              1,
+			RoutingDecisionID:          decision.DecisionID,
+			ProviderConnectionID:       decision.SelectedCandidate.CandidateID,
+			ProviderConnectionRevision: decision.SelectedCandidate.ConnectionRevision,
+			ProviderNamespaceID:        decision.SelectedCandidate.ProviderNamespaceID,
+			Provider:                   decision.SelectedCandidate.Provider,
+			RerouteDisposition:         domain.RerouteBlocked,
+			CreatedAt:                  now,
+			UpdatedAt:                  now,
 		},
 		Operation: domain.ProviderOperation{
-			ID:                     operationID,
-			PaymentIntentID:        intent.ID,
-			PaymentAttemptID:       attemptID,
-			Kind:                   domain.OperationSale,
-			AmountMinor:            intent.AmountMinor,
-			Currency:               intent.Currency,
-			Provider:               decision.SelectedProvider,
-			ProviderIdempotencyKey: operationID,
-			MerchantReference:      operationID,
-			RequestHash:            idempotency.Fingerprint("provider_sale", providerPayload),
-			CreatedAt:              now,
-			UpdatedAt:              now,
+			ID:                         operationID,
+			PaymentIntentID:            intent.ID,
+			PaymentAttemptID:           attemptID,
+			Kind:                       domain.OperationSale,
+			AmountMinor:                intent.AmountMinor,
+			Currency:                   intent.Currency,
+			ProviderConnectionID:       decision.SelectedCandidate.CandidateID,
+			ProviderConnectionRevision: decision.SelectedCandidate.ConnectionRevision,
+			ProviderNamespaceID:        decision.SelectedCandidate.ProviderNamespaceID,
+			Provider:                   decision.SelectedCandidate.Provider,
+			ProviderIdempotencyKey:     operationID,
+			MerchantReference:          operationID,
+			RequestHash:                idempotency.Fingerprint("provider_sale", providerPayload),
+			CreatedAt:                  now,
+			UpdatedAt:                  now,
 		},
 	})
 	if err != nil {
@@ -260,8 +269,9 @@ func (s *Service) GetIntent(ctx context.Context, merchantID, intentID string) (R
 }
 
 func (s *Service) ReceiveProviderOutcome(ctx context.Context, outcome domain.ProviderOutcome, sanitizedPayload []byte) (Result, bool, error) {
-	if outcome.EventID == "" || outcome.Provider == "" || (outcome.OperationID == "" && outcome.ProviderIdempotencyKey == "") {
-		return Result{}, false, fmt.Errorf("%w: event_id, provider and operation correlation are required", ErrInvalidRequest)
+	if outcome.EventID == "" || outcome.ProviderConnectionID == "" || outcome.ProviderConnectionRevision == "" ||
+		outcome.ProviderNamespaceID == "" || outcome.Provider == "" || (outcome.OperationID == "" && outcome.ProviderIdempotencyKey == "") {
+		return Result{}, false, fmt.Errorf("%w: event_id, provider connection, provider and operation correlation are required", ErrInvalidRequest)
 	}
 	receivedAt := s.now().UTC()
 	result, err := s.store.ApplyOutcome(ctx, outcome, sanitizedPayload, receivedAt, storedResponseForIntent)
@@ -287,35 +297,35 @@ func (s *Service) executeGateway(ctx context.Context, aggregate postgres.Aggrega
 	callContext, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
 	defer cancel()
 	outcome, err := s.gateway.Execute(callContext, clients.GatewayOperationRequest{
-		OperationID:        aggregate.Operation.ID,
-		AttemptID:          aggregate.Attempt.ID,
-		Provider:           aggregate.Operation.Provider,
-		AmountMinor:        aggregate.Operation.AmountMinor,
-		Currency:           aggregate.Operation.Currency,
-		PaymentMethodToken: aggregate.Intent.PaymentMethodToken,
-		CaptureMethod:      string(aggregate.Intent.CaptureMethod),
+		OperationID:                aggregate.Operation.ID,
+		AttemptID:                  aggregate.Attempt.ID,
+		ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+		Provider:                   aggregate.Operation.Provider,
+		AmountMinor:                aggregate.Operation.AmountMinor,
+		Currency:                   aggregate.Operation.Currency,
+		PaymentMethodToken:         aggregate.Intent.PaymentMethodToken,
+		CaptureMethod:              string(aggregate.Intent.CaptureMethod),
 	})
 	if err == nil {
 		outcome.EventID = newBestEffortEventID("sync_")
 		return outcome
 	}
-	return domain.ProviderOutcome{
-		EventID:                newBestEffortEventID("sync_unknown_"),
-		Provider:               aggregate.Operation.Provider,
-		OperationID:            aggregate.Operation.ID,
-		ProviderIdempotencyKey: aggregate.Operation.ProviderIdempotencyKey,
-		Status:                 domain.OutcomeUnknown,
-		SideEffectCertainty:    domain.SideEffectPossible,
-		RetryMode:              domain.RetryQueryOrWait,
-		NormalizedCode:         "gateway_transport_unknown",
-		Message:                err.Error(),
-	}
+	return gatewayFailureOutcome(aggregate, "sync_unknown_", "gateway_transport_unknown", err)
 }
 
 func (s *Service) queryGateway(ctx context.Context, aggregate postgres.Aggregate) domain.ProviderOutcome {
 	callContext, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
 	defer cancel()
-	outcome, err := s.gateway.Query(callContext, aggregate.Operation.ID)
+	outcome, err := s.gateway.Query(callContext, clients.GatewayOperationIdentity{
+		OperationID:                aggregate.Operation.ID,
+		AttemptID:                  aggregate.Attempt.ID,
+		ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+		Provider:                   aggregate.Operation.Provider,
+	})
 	if err == nil {
 		outcome.EventID = newBestEffortEventID("query_")
 		return outcome
@@ -327,17 +337,30 @@ func (s *Service) queryGateway(ctx context.Context, aggregate postgres.Aggregate
 		// before any call. This is not a new Attempt or cross-provider fallback.
 		return s.executeGateway(ctx, aggregate)
 	}
-	return domain.ProviderOutcome{
-		EventID:                newBestEffortEventID("query_unknown_"),
-		Provider:               aggregate.Operation.Provider,
-		OperationID:            aggregate.Operation.ID,
-		ProviderIdempotencyKey: aggregate.Operation.ProviderIdempotencyKey,
-		Status:                 domain.OutcomeUnknown,
-		SideEffectCertainty:    domain.SideEffectPossible,
-		RetryMode:              domain.RetryQueryOrWait,
-		NormalizedCode:         "gateway_query_unknown",
-		Message:                err.Error(),
+	return gatewayFailureOutcome(aggregate, "query_unknown_", "gateway_query_unknown", err)
+}
+
+func gatewayFailureOutcome(aggregate postgres.Aggregate, eventPrefix, code string, err error) domain.ProviderOutcome {
+	outcome := domain.ProviderOutcome{
+		EventID:                    newBestEffortEventID(eventPrefix),
+		ProviderConnectionID:       aggregate.Operation.ProviderConnectionID,
+		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID,
+		Provider:                   aggregate.Operation.Provider,
+		OperationID:                aggregate.Operation.ID,
+		ProviderIdempotencyKey:     aggregate.Operation.ProviderIdempotencyKey,
+		Status:                     domain.OutcomeUnknown,
+		SideEffectCertainty:        domain.SideEffectPossible,
+		RetryMode:                  domain.RetryQueryOrWait,
+		NormalizedCode:             code,
+		Message:                    err.Error(),
 	}
+	if errors.Is(err, clients.ErrGatewayIdentityMismatch) {
+		outcome.RequiresReview = true
+		outcome.RetryMode = domain.RetryNone
+		outcome.NormalizedCode = "gateway_execution_identity_conflict"
+	}
+	return outcome
 }
 
 func (s *Service) applyOutcome(ctx context.Context, outcome domain.ProviderOutcome) (postgres.ApplyOutcomeResult, error) {

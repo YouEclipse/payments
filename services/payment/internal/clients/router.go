@@ -16,6 +16,7 @@ var (
 	ErrNoEligibleProvider       = errors.New("no eligible provider")
 	ErrUpstream                 = errors.New("internal upstream request failed")
 	ErrGatewayOperationNotFound = errors.New("gateway operation not found")
+	ErrGatewayIdentityMismatch  = fmt.Errorf("%w: gateway execution identity mismatch", ErrUpstream)
 )
 
 type RouterClient struct {
@@ -46,16 +47,27 @@ type RoutingRequest struct {
 }
 
 type RoutingDecision struct {
-	DecisionID       string              `json:"decision_id"`
-	SelectedProvider string              `json:"selected_provider"`
-	CandidateOrder   []string            `json:"candidate_order"`
-	Exclusions       []ProviderExclusion `json:"exclusions"`
-	PolicyVersion    string              `json:"policy_version"`
+	DecisionID        string               `json:"decision_id"`
+	SelectedCandidate RouteCandidate       `json:"selected_candidate"`
+	CandidateOrder    []string             `json:"candidate_order"`
+	Exclusions        []CandidateExclusion `json:"exclusions"`
+	PolicyVersion     string               `json:"policy_version"`
 }
 
-type ProviderExclusion struct {
-	Provider string            `json:"provider"`
-	Reasons  []ExclusionReason `json:"reasons"`
+type RouteCandidate struct {
+	CandidateID         string `json:"candidate_id"`
+	ConnectionRevision  string `json:"connection_revision"`
+	ProviderNamespaceID string `json:"provider_namespace_id"`
+	Provider            string `json:"provider"`
+	MerchantAccount     string `json:"merchant_account"`
+	Connector           string `json:"connector"`
+	Region              string `json:"region"`
+}
+
+type CandidateExclusion struct {
+	CandidateID string            `json:"candidate_id"`
+	Provider    string            `json:"provider"`
+	Reasons     []ExclusionReason `json:"reasons"`
 }
 
 type ExclusionReason struct {
@@ -95,10 +107,30 @@ func (c *RouterClient) Decide(ctx context.Context, routingRequest RoutingRequest
 	if response.StatusCode != http.StatusOK {
 		return RoutingDecision{}, fmt.Errorf("%w: router returned HTTP %d", ErrUpstream, response.StatusCode)
 	}
-	if decision.DecisionID == "" || decision.SelectedProvider == "" {
+	selected := decision.SelectedCandidate
+	if decision.DecisionID == "" || !validPlatformIdentifier(selected.CandidateID) || !validPlatformIdentifier(selected.ConnectionRevision) ||
+		!validPlatformIdentifier(selected.ProviderNamespaceID) || selected.Provider == "" ||
+		selected.MerchantAccount == "" || selected.Connector == "" || selected.Region == "" {
 		return RoutingDecision{}, fmt.Errorf("%w: router returned an incomplete decision", ErrUpstream)
 	}
+	if len(decision.CandidateOrder) == 0 || decision.CandidateOrder[0] != selected.CandidateID {
+		return RoutingDecision{}, fmt.Errorf("%w: router selected candidate does not match candidate order", ErrUpstream)
+	}
 	return decision, nil
+}
+
+func validPlatformIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') ||
+			(index > 0 && (character == '.' || character == '_' || character == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func normalizeBaseURL(raw string) (string, error) {

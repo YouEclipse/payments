@@ -80,6 +80,7 @@ services:
       PAYMENTS_ENVIRONMENT: ${PAYMENTS_ENVIRONMENT:-local}
       ROUTER_HTTP_ADDR: :8081
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
+      ROUTER_CONFIG_JSON: ${ROUTER_CONFIG_JSON:-}
     ports:
       - "${ROUTER_PORT:-8081}:8081"
     healthcheck:
@@ -103,8 +104,12 @@ services:
       DATABASE_URL: ${GATEWAY_DATABASE_URL:-postgres://payments:payments-local-only@postgres:5432/payments?sslmode=disable}
       MIGRATE_ON_START: "true"
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
-      PROVIDER_ENDPOINTS: simulator_a=http://simulator:8083
-      PROVIDER_WEBHOOK_SECRETS: simulator_a=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
+      PROVIDER_ENDPOINTS: ${PROVIDER_ENDPOINTS:-simulator_a=http://simulator:8083,simulator_a_us_primary=http://simulator:8083,simulator_a_eu_backup=http://simulator:8083}
+      PROVIDER_CONNECTION_PROVIDERS: ${PROVIDER_CONNECTION_PROVIDERS:-simulator_a=simulator_a,simulator_a_us_primary=simulator_a,simulator_a_eu_backup=simulator_a}
+      PROVIDER_CONNECTION_REVISIONS: ${PROVIDER_CONNECTION_REVISIONS:-simulator_a=legacy_v1,simulator_a_us_primary=simulator_a_us_primary_v1,simulator_a_eu_backup=simulator_a_eu_backup_v1}
+      PROVIDER_NAMESPACE_IDS: ${PROVIDER_NAMESPACE_IDS:-simulator_a=simulator_a,simulator_a_us_primary=simulator_a,simulator_a_eu_backup=simulator_a}
+      PROVIDER_RECOVERY_ALIASES: ${PROVIDER_RECOVERY_ALIASES:-simulator_a=simulator_a_us_primary}
+      PROVIDER_WEBHOOK_SECRETS: simulator_a=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret},simulator_a_us_primary=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret},simulator_a_eu_backup=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
       GATEWAY_WEBHOOK_BASE_URL: http://gateway:8082
       PAYMENT_OUTCOME_URL: http://payment:8080/internal/v1/provider-outcomes
       PROVIDER_REQUEST_TIMEOUT: 300ms

@@ -40,7 +40,7 @@ func TestDurablyQuarantinedProviderOutcomeReturnsAcceptedWithKnownIdentity(t *te
 		},
 	}}
 	handler := NewHandler(service, nil, NewAuthenticator(nil, "internal-test-token"), slog.New(slog.NewTextHandler(io.Discard, nil)))
-	body := []byte(`{"event_id":"evt_bad","operation_id":"op_bad","provider":"provider_a","status":"succeeded","side_effect_certainty":"confirmed"}`)
+	body := []byte(`{"event_id":"evt_bad","operation_id":"op_bad","provider_connection_id":"provider_a_us_primary","provider_connection_revision":"provider_a_us_primary_v1","provider_namespace_id":"provider_a","provider":"provider_a","status":"succeeded","side_effect_certainty":"confirmed"}`)
 	request := httptest.NewRequest(http.MethodPost, "/internal/v1/provider-outcomes", bytes.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Internal-Token", "internal-test-token")

@@ -350,6 +350,9 @@ components:
       required:
         - event_id
         - operation_id
+        - provider_connection_id
+        - provider_connection_revision
+        - provider_namespace_id
         - provider
         - status
         - side_effect_certainty
@@ -363,6 +366,18 @@ components:
         attempt_id:
           type: string
           pattern: "^att_[a-f0-9]{32}$"
+        provider_connection_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Exact provider account, connector, and region connection selected by Router.
+        provider_connection_revision:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Immutable connection configuration revision pinned by the original routing decision.
+        provider_namespace_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Conservative namespace for provider references and event IDs; aliases of the same account share it.
         provider:
           type: string
           minLength: 1

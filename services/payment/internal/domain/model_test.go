@@ -14,6 +14,9 @@ func TestSuccessfulAutomaticCaptureTransition(t *testing.T) {
 		t.Fatalf("mark sending: %v", err)
 	}
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   "simulator_a",
 		OperationID:                operation.ID,
 		ProviderIdempotencyKey:     operation.ProviderIdempotencyKey,
@@ -44,12 +47,15 @@ func TestUnknownBlocksNewConfirmationAndConverges(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:               operation.Provider,
-		OperationID:            operation.ID,
-		ProviderIdempotencyKey: operation.ProviderIdempotencyKey,
-		Status:                 OutcomeUnknown,
-		SideEffectCertainty:    SideEffectPossible,
-		RetryMode:              RetryQueryOrWait,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		OperationID:                operation.ID,
+		ProviderIdempotencyKey:     operation.ProviderIdempotencyKey,
+		Status:                     OutcomeUnknown,
+		SideEffectCertainty:        SideEffectPossible,
+		RetryMode:                  RetryQueryOrWait,
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -68,6 +74,9 @@ func TestUnknownBlocksNewConfirmationAndConverges(t *testing.T) {
 	}
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		OperationID:                operation.ID,
 		ProviderIdempotencyKey:     operation.ProviderIdempotencyKey,
@@ -88,12 +97,15 @@ func TestAmbiguousFailureIsDowngradedToUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:               operation.Provider,
-		OperationID:            operation.ID,
-		ProviderIdempotencyKey: operation.ProviderIdempotencyKey,
-		Status:                 OutcomeFailed,
-		SideEffectCertainty:    SideEffectPossible,
-		NormalizedCode:         "http_500",
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		OperationID:                operation.ID,
+		ProviderIdempotencyKey:     operation.ProviderIdempotencyKey,
+		Status:                     OutcomeFailed,
+		SideEffectCertainty:        SideEffectPossible,
+		NormalizedCode:             "http_500",
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -110,12 +122,15 @@ func TestDeclineIsConclusiveButDoesNotAllowFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:               operation.Provider,
-		OperationID:            operation.ID,
-		ProviderIdempotencyKey: operation.ProviderIdempotencyKey,
-		Status:                 OutcomeDeclined,
-		SideEffectCertainty:    SideEffectNone,
-		NormalizedCode:         "do_not_honor",
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		OperationID:                operation.ID,
+		ProviderIdempotencyKey:     operation.ProviderIdempotencyKey,
+		Status:                     OutcomeDeclined,
+		SideEffectCertainty:        SideEffectNone,
+		NormalizedCode:             "do_not_honor",
 	}, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -132,6 +147,9 @@ func TestConflictingTerminalOutcomeRequiresReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "psp_payment_conflict",
@@ -141,8 +159,11 @@ func TestConflictingTerminalOutcomeRequiresReview(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomeDeclined,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeDeclined,
 	}, now.Add(2*time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !result.Conflict || intent.IntegrityStatus != IntegrityReviewRequired {
 		t.Fatalf("conflict was not surfaced: result=%+v err=%v intent=%+v", result, err, intent)
@@ -156,6 +177,9 @@ func TestReviewRequiredIsNotIgnoredAfterTerminalSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "psp_payment_review",
@@ -165,9 +189,12 @@ func TestReviewRequiredIsNotIgnoredAfterTerminalSuccess(t *testing.T) {
 	}
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:       operation.Provider,
-		Status:         OutcomeUnknown,
-		RequiresReview: true,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
+		RequiresReview:             true,
 	}, now.Add(2*time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !result.Conflict || !result.Changed {
 		t.Fatalf("review_required conflict was ignored: result=%+v err=%v", result, err)
@@ -184,14 +211,20 @@ func TestReviewRequiredIsNotIgnoredAfterTerminalFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:            operation.Provider,
-		Status:              OutcomeDeclined,
-		SideEffectCertainty: SideEffectNone,
-		NormalizedCode:      "do_not_honor",
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeDeclined,
+		SideEffectCertainty:        SideEffectNone,
+		NormalizedCode:             "do_not_honor",
 	}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeUnknown,
 		SideEffectCertainty:        SideEffectPossible,
@@ -214,20 +247,26 @@ func TestReviewRequiredUnknownAfterPendingStopsAutomaticRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:            operation.Provider,
-		Status:              OutcomePending,
-		SideEffectCertainty: SideEffectPossible,
-		RetryMode:           RetryQueryOrWait,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomePending,
+		SideEffectCertainty:        SideEffectPossible,
+		RetryMode:                  RetryQueryOrWait,
 	}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:            operation.Provider,
-		Status:              OutcomeUnknown,
-		SideEffectCertainty: SideEffectPossible,
-		RetryMode:           RetryQueryOrWait,
-		RequiresReview:      true,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
+		SideEffectCertainty:        SideEffectPossible,
+		RetryMode:                  RetryQueryOrWait,
+		RequiresReview:             true,
 	}, now.Add(2*time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !result.Changed || !result.Conflict {
 		t.Fatalf("review-required UNKNOWN was not persisted as a conflict: result=%+v err=%v", result, err)
@@ -250,6 +289,9 @@ func TestLateDuplicateSuccessWithStableReferencesIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "psp_payment_1",
@@ -258,6 +300,9 @@ func TestLateDuplicateSuccessWithStableReferencesIsNoop(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "psp_payment_1",
@@ -279,10 +324,13 @@ func TestSuccessWithoutProviderReferenceBecomesUnknownAndRequiresReview(t *testi
 	}
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider:            operation.Provider,
-		OperationID:         operation.ID,
-		Status:              OutcomeSucceeded,
-		SideEffectCertainty: SideEffectConfirmed,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		OperationID:                operation.ID,
+		Status:                     OutcomeSucceeded,
+		SideEffectCertainty:        SideEffectConfirmed,
 	}, now.Add(time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !result.Conflict || !result.Changed || !result.IntentChanged {
 		t.Fatalf("reference-less success was not escalated: result=%+v err=%v", result, err)
@@ -302,8 +350,11 @@ func TestRepeatedUnknownOnlyAdvancesOperationRecoveryMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomeUnknown,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
 	}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -313,8 +364,11 @@ func TestRepeatedUnknownOnlyAdvancesOperationRecoveryMetadata(t *testing.T) {
 	firstRetryAt := *operation.NextRetryAt
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomeUnknown,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
 	}, now.Add(2*time.Second))
 	if err != nil || !result.Changed || result.IntentChanged || result.Conflict {
 		t.Fatalf("repeated UNKNOWN result=%+v err=%v", result, err)
@@ -334,8 +388,11 @@ func TestPendingThenTransportUnknownPreservesPendingAndAdvancesBackoff(t *testin
 		t.Fatal(err)
 	}
 	if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomePending,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomePending,
 	}, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
@@ -343,8 +400,11 @@ func TestPendingThenTransportUnknownPreservesPendingAndAdvancesBackoff(t *testin
 	attemptVersion := attempt.Version
 	firstRetryAt := *operation.NextRetryAt
 	repeatedPending, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomePending,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomePending,
 	}, now.Add(2*time.Second))
 	if err != nil || !repeatedPending.Changed || repeatedPending.IntentChanged {
 		t.Fatalf("repeated pending result=%+v err=%v", repeatedPending, err)
@@ -355,8 +415,11 @@ func TestPendingThenTransportUnknownPreservesPendingAndAdvancesBackoff(t *testin
 	secondRetryAt := *operation.NextRetryAt
 
 	result, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
-		Provider: operation.Provider,
-		Status:   OutcomeUnknown,
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
 	}, now.Add(3*time.Second))
 	if err != nil || !result.Changed || result.IntentChanged {
 		t.Fatalf("pending UNKNOWN result=%+v err=%v", result, err)
@@ -394,6 +457,9 @@ func TestManualReviewStopsAutomaticRecoveryAndPreservesFunds(t *testing.T) {
 	}
 
 	late, err := ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
 		Provider:                   operation.Provider,
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "another_reference",
@@ -401,6 +467,56 @@ func TestManualReviewStopsAutomaticRecoveryAndPreservesFunds(t *testing.T) {
 	}, now.Add(2*time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !late.Conflict || intent.CapturedAmountMinor != 0 || operation.Status != OperationReviewRequired {
 		t.Fatalf("automatic outcome escaped manual review: result=%+v err=%v intent=%+v operation=%+v", late, err, intent, operation)
+	}
+}
+
+func TestProviderOutcomeCannotChangePinnedRevisionOrNamespace(t *testing.T) {
+	for _, field := range []string{"revision", "namespace"} {
+		t.Run(field, func(t *testing.T) {
+			intent, attempt, operation := preparedAggregate(t)
+			outcome := ProviderOutcome{
+				ProviderConnectionID:       operation.ProviderConnectionID,
+				ProviderConnectionRevision: operation.ProviderConnectionRevision,
+				ProviderNamespaceID:        operation.ProviderNamespaceID,
+				Provider:                   operation.Provider,
+				OperationID:                operation.ID,
+				Status:                     OutcomeUnknown,
+				SideEffectCertainty:        SideEffectPossible,
+			}
+			if field == "revision" {
+				outcome.ProviderConnectionRevision = "rebound_v2"
+			} else {
+				outcome.ProviderNamespaceID = "another_account"
+			}
+			beforeIntentVersion, beforeOperationVersion := intent.Version, operation.Version
+			if _, err := ApplyProviderOutcome(&intent, &attempt, &operation, outcome, time.Now()); err == nil {
+				t.Fatal("identity drift was accepted")
+			}
+			if intent.Version != beforeIntentVersion || operation.Version != beforeOperationVersion || operation.Status != OperationCreated {
+				t.Fatalf("rejected identity drift changed funds state: intent=%+v operation=%+v", intent, operation)
+			}
+		})
+	}
+}
+
+func TestPrepareConfirmationRequiresMatchingExecutionIdentity(t *testing.T) {
+	for _, field := range []string{"revision", "namespace"} {
+		t.Run(field, func(t *testing.T) {
+			intent, attempt, operation := preparedAggregate(t)
+			intent.Status = IntentRequiresConfirmation
+			intent.ActiveAttemptID = ""
+			if field == "revision" {
+				operation.ProviderConnectionRevision = "another_revision"
+			} else {
+				operation.ProviderNamespaceID = "another_namespace"
+			}
+			if err := PrepareConfirmation(&intent, &attempt, &operation, time.Now()); err == nil {
+				t.Fatal("mismatched attempt/operation execution identity was accepted")
+			}
+			if intent.Status != IntentRequiresConfirmation || intent.ActiveAttemptID != "" {
+				t.Fatalf("invalid identity created an active attempt: %+v", intent)
+			}
+		})
 	}
 }
 
@@ -412,25 +528,31 @@ func preparedAggregate(t *testing.T) (PaymentIntent, PaymentAttempt, ProviderOpe
 		t.Fatal(err)
 	}
 	attempt := PaymentAttempt{
-		ID:                "att_test",
-		PaymentIntentID:   intent.ID,
-		AttemptNumber:     1,
-		RoutingDecisionID: "rtd_test",
-		Provider:          "simulator_a",
-		CreatedAt:         now,
+		ID:                         "att_test",
+		PaymentIntentID:            intent.ID,
+		AttemptNumber:              1,
+		RoutingDecisionID:          "rtd_test",
+		ProviderConnectionID:       "simulator_a_us_primary",
+		ProviderConnectionRevision: "simulator_a_us_primary_v1",
+		ProviderNamespaceID:        "simulator_a",
+		Provider:                   "simulator_a",
+		CreatedAt:                  now,
 	}
 	operation := ProviderOperation{
-		ID:                     "op_test",
-		PaymentIntentID:        intent.ID,
-		PaymentAttemptID:       attempt.ID,
-		Kind:                   OperationSale,
-		AmountMinor:            intent.AmountMinor,
-		Currency:               intent.Currency,
-		Provider:               attempt.Provider,
-		ProviderIdempotencyKey: "op_test",
-		MerchantReference:      "op_test",
-		RequestHash:            []byte("request hash"),
-		CreatedAt:              now,
+		ID:                         "op_test",
+		PaymentIntentID:            intent.ID,
+		PaymentAttemptID:           attempt.ID,
+		Kind:                       OperationSale,
+		AmountMinor:                intent.AmountMinor,
+		Currency:                   intent.Currency,
+		ProviderConnectionID:       attempt.ProviderConnectionID,
+		ProviderConnectionRevision: attempt.ProviderConnectionRevision,
+		ProviderNamespaceID:        attempt.ProviderNamespaceID,
+		Provider:                   attempt.Provider,
+		ProviderIdempotencyKey:     "op_test",
+		MerchantReference:          "op_test",
+		RequestHash:                []byte("request hash"),
+		CreatedAt:                  now,
 	}
 	if err := PrepareConfirmation(&intent, &attempt, &operation, now); err != nil {
 		t.Fatal(err)

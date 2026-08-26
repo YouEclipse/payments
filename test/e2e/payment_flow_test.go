@@ -117,6 +117,27 @@ func assertSingleFundsPath(t *testing.T, paymentIntentID string) {
 	if attempts != 1 || paymentOperations != 1 || gatewayOperations != 1 {
 		t.Fatalf("UNKNOWN created another funds path: attempts=%d payment_operations=%d gateway_operations=%d", attempts, paymentOperations, gatewayOperations)
 	}
+	var paymentConnectionID, paymentRevision, paymentNamespace string
+	var gatewayConnectionID, gatewayRevision, gatewayNamespace string
+	if err := pool.QueryRow(ctx, `
+		SELECT payment_operation.provider_connection_id,
+		       payment_operation.provider_connection_revision,
+		       payment_operation.provider_namespace_id,
+		       gateway_operation.provider_connection_id,
+		       gateway_operation.provider_connection_revision,
+		       gateway_operation.provider_namespace_id
+		FROM provider_operations payment_operation
+		JOIN provider_gateway.operations gateway_operation
+		  ON gateway_operation.operation_id=payment_operation.id
+		WHERE payment_operation.payment_intent_id=$1`, paymentIntentID,
+	).Scan(&paymentConnectionID, &paymentRevision, &paymentNamespace, &gatewayConnectionID, &gatewayRevision, &gatewayNamespace); err != nil {
+		t.Fatalf("read pinned provider connection: %v", err)
+	}
+	if paymentConnectionID != "simulator_a_us_primary" || paymentRevision != "simulator_a_us_primary_v1" || paymentNamespace != "simulator_a" ||
+		gatewayConnectionID != paymentConnectionID || gatewayRevision != paymentRevision || gatewayNamespace != paymentNamespace {
+		t.Fatalf("UNKNOWN recovery drifted execution identity: payment=(%q,%q,%q) gateway=(%q,%q,%q)",
+			paymentConnectionID, paymentRevision, paymentNamespace, gatewayConnectionID, gatewayRevision, gatewayNamespace)
+	}
 }
 
 func createIntent(t *testing.T, baseURL, apiKey, idempotencyKey, merchantReference, currency, token string) (paymentIntent, *http.Response) {

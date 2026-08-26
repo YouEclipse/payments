@@ -48,42 +48,45 @@ func (e *Engine) Decide(req Request) (Decision, error) {
 		return Decision{}, err
 	}
 
-	policyPosition := make(map[string]struct{}, len(e.policy.ProviderOrder))
-	for _, provider := range e.policy.ProviderOrder {
-		policyPosition[provider] = struct{}{}
+	policyPosition := make(map[string]struct{}, len(e.policy.CandidateOrder))
+	for _, candidateID := range e.policy.CandidateOrder {
+		policyPosition[candidateID] = struct{}{}
 	}
 
 	eligible := make(map[string]bool, len(e.candidates))
+	candidateByID := make(map[string]Candidate, len(e.candidates))
 	exclusions := make([]Exclusion, 0, len(e.candidates))
 
 	for _, candidate := range e.candidates {
+		candidateByID[candidate.ID] = candidate
 		reasons := eligibilityReasons(req, candidate)
-		if _, ok := policyPosition[candidate.Provider]; !ok {
+		if _, ok := policyPosition[candidate.ID]; !ok {
 			reasons = append(reasons, Reason{
 				Code:   ReasonNotInPolicy,
-				Detail: "provider is not present in the active static policy",
+				Detail: "candidate is not present in the active static policy",
 			})
 		}
 
 		if len(reasons) == 0 {
-			eligible[candidate.Provider] = true
+			eligible[candidate.ID] = true
 			continue
 		}
 
 		exclusions = append(exclusions, Exclusion{
-			Provider: candidate.Provider,
-			Reasons:  reasons,
+			CandidateID: candidate.ID,
+			Provider:    candidate.Provider,
+			Reasons:     reasons,
 		})
 	}
 
 	sort.Slice(exclusions, func(i, j int) bool {
-		return exclusions[i].Provider < exclusions[j].Provider
+		return exclusions[i].CandidateID < exclusions[j].CandidateID
 	})
 
 	candidateOrder := make([]string, 0, len(eligible))
-	for _, provider := range e.policy.ProviderOrder {
-		if eligible[provider] {
-			candidateOrder = append(candidateOrder, provider)
+	for _, candidateID := range e.policy.CandidateOrder {
+		if eligible[candidateID] {
+			candidateOrder = append(candidateOrder, candidateID)
 		}
 	}
 
@@ -93,7 +96,16 @@ func (e *Engine) Decide(req Request) (Decision, error) {
 		PolicyVersion:  e.policy.Version,
 	}
 	if len(candidateOrder) > 0 {
-		decision.SelectedProvider = candidateOrder[0]
+		selected := candidateByID[candidateOrder[0]]
+		decision.SelectedCandidate = CandidateRef{
+			ID:                  selected.ID,
+			ConnectionRevision:  selected.ConnectionRevision,
+			ProviderNamespaceID: selected.ProviderNamespaceID,
+			Provider:            selected.Provider,
+			MerchantAccount:     selected.MerchantAccount,
+			Connector:           selected.Connector,
+			Region:              selected.Region,
+		}
 	}
 	decision.ID = decisionID(req, e.policy, e.candidates, decision)
 
@@ -179,42 +191,88 @@ func validateConfig(config Config) error {
 	if strings.TrimSpace(config.Policy.Version) == "" {
 		return &ValidationError{Field: "policy.version", Message: "must not be empty"}
 	}
+	if strings.TrimSpace(config.Policy.Version) != config.Policy.Version {
+		return &ValidationError{Field: "policy.version", Message: "must not contain surrounding whitespace"}
+	}
 	if len(config.Candidates) == 0 {
 		return &ValidationError{Field: "candidates", Message: "must contain at least one candidate"}
 	}
-	if len(config.Policy.ProviderOrder) == 0 {
-		return &ValidationError{Field: "policy.provider_order", Message: "must contain at least one provider"}
+	if len(config.Policy.CandidateOrder) == 0 {
+		return &ValidationError{Field: "policy.candidate_order", Message: "must contain at least one candidate"}
 	}
 
-	providers := make(map[string]struct{}, len(config.Candidates))
+	candidates := make(map[string]struct{}, len(config.Candidates))
+	executionIdentities := make(map[[4]string]string, len(config.Candidates))
 	for i, candidate := range config.Candidates {
-		field := fmt.Sprintf("candidates[%d].provider", i)
+		field := fmt.Sprintf("candidates[%d].candidate_id", i)
+		if strings.TrimSpace(candidate.ID) == "" {
+			return &ValidationError{Field: field, Message: "must not be empty"}
+		}
+		if strings.TrimSpace(candidate.ID) != candidate.ID {
+			return &ValidationError{Field: field, Message: "must not contain surrounding whitespace"}
+		}
+		if !isPlatformIdentifier(candidate.ID) {
+			return &ValidationError{Field: field, Message: "must use lowercase letters, digits, dot, underscore or hyphen and be at most 128 characters"}
+		}
+		if _, exists := candidates[candidate.ID]; exists {
+			return &ValidationError{Field: field, Message: "must be unique"}
+		}
+		candidates[candidate.ID] = struct{}{}
+
+		field = fmt.Sprintf("candidates[%d].provider", i)
 		if strings.TrimSpace(candidate.Provider) == "" {
 			return &ValidationError{Field: field, Message: "must not be empty"}
 		}
-		if _, exists := providers[candidate.Provider]; exists {
-			return &ValidationError{Field: field, Message: "must be unique"}
+		if strings.TrimSpace(candidate.Provider) != candidate.Provider {
+			return &ValidationError{Field: field, Message: "must not contain surrounding whitespace"}
 		}
-		providers[candidate.Provider] = struct{}{}
+		for fieldName, value := range map[string]string{
+			"connection_revision":   candidate.ConnectionRevision,
+			"provider_namespace_id": candidate.ProviderNamespaceID,
+			"merchant_account":      candidate.MerchantAccount,
+			"connector":             candidate.Connector,
+			"region":                candidate.Region,
+		} {
+			if strings.TrimSpace(value) == "" {
+				return &ValidationError{Field: fmt.Sprintf("candidates[%d].%s", i, fieldName), Message: "must not be empty"}
+			}
+			if strings.TrimSpace(value) != value {
+				return &ValidationError{Field: fmt.Sprintf("candidates[%d].%s", i, fieldName), Message: "must not contain surrounding whitespace"}
+			}
+			if (fieldName == "connection_revision" || fieldName == "provider_namespace_id") && !isPlatformIdentifier(value) {
+				return &ValidationError{Field: fmt.Sprintf("candidates[%d].%s", i, fieldName), Message: "must use lowercase letters, digits, dot, underscore or hyphen and be at most 128 characters"}
+			}
+		}
+		executionIdentity := [4]string{candidate.Provider, candidate.MerchantAccount, candidate.Connector, candidate.Region}
+		if existingID, exists := executionIdentities[executionIdentity]; exists {
+			return &ValidationError{
+				Field:   fmt.Sprintf("candidates[%d].candidate_id", i),
+				Message: fmt.Sprintf("duplicates execution identity of candidate %s", existingID),
+			}
+		}
+		executionIdentities[executionIdentity] = candidate.ID
 
 		if err := validateCapabilities(i, candidate); err != nil {
 			return err
 		}
 	}
 
-	policyProviders := make(map[string]struct{}, len(config.Policy.ProviderOrder))
-	for i, provider := range config.Policy.ProviderOrder {
-		field := fmt.Sprintf("policy.provider_order[%d]", i)
-		if strings.TrimSpace(provider) == "" {
+	policyCandidates := make(map[string]struct{}, len(config.Policy.CandidateOrder))
+	for i, candidateID := range config.Policy.CandidateOrder {
+		field := fmt.Sprintf("policy.candidate_order[%d]", i)
+		if strings.TrimSpace(candidateID) == "" {
 			return &ValidationError{Field: field, Message: "must not be empty"}
 		}
-		if _, exists := policyProviders[provider]; exists {
+		if strings.TrimSpace(candidateID) != candidateID {
+			return &ValidationError{Field: field, Message: "must not contain surrounding whitespace"}
+		}
+		if _, exists := policyCandidates[candidateID]; exists {
 			return &ValidationError{Field: field, Message: "must be unique"}
 		}
-		if _, exists := providers[provider]; !exists {
+		if _, exists := candidates[candidateID]; !exists {
 			return &ValidationError{Field: field, Message: "must reference a candidate"}
 		}
-		policyProviders[provider] = struct{}{}
+		policyCandidates[candidateID] = struct{}{}
 	}
 
 	return nil
@@ -276,17 +334,37 @@ func isSupportedOperation(value string) bool {
 	return value == "sale" || value == "authorize"
 }
 
+func isPlatformIdentifier(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for index, character := range value {
+		if (character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') ||
+			(index > 0 && (character == '.' || character == '_' || character == '-')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 func cloneConfig(config Config) Config {
 	cloned := Config{
 		Policy: Policy{
-			Version:       config.Policy.Version,
-			ProviderOrder: append([]string(nil), config.Policy.ProviderOrder...),
+			Version:        config.Policy.Version,
+			CandidateOrder: append([]string(nil), config.Policy.CandidateOrder...),
 		},
 		Candidates: make([]Candidate, 0, len(config.Candidates)),
 	}
 	for _, candidate := range config.Candidates {
 		cloned.Candidates = append(cloned.Candidates, Candidate{
+			ID:                      candidate.ID,
+			ConnectionRevision:      candidate.ConnectionRevision,
+			ProviderNamespaceID:     candidate.ProviderNamespaceID,
 			Provider:                candidate.Provider,
+			MerchantAccount:         candidate.MerchantAccount,
+			Connector:               candidate.Connector,
+			Region:                  candidate.Region,
 			Enabled:                 candidate.Enabled,
 			SupportedCurrencies:     append([]string(nil), candidate.SupportedCurrencies...),
 			SupportedPaymentMethods: append([]string(nil), candidate.SupportedPaymentMethods...),
@@ -298,7 +376,13 @@ func cloneConfig(config Config) Config {
 
 func decisionID(req Request, policy Policy, configuredCandidates []Candidate, decision Decision) string {
 	type canonicalCandidate struct {
+		ID                      string   `json:"candidate_id"`
+		ConnectionRevision      string   `json:"connection_revision"`
+		ProviderNamespaceID     string   `json:"provider_namespace_id"`
 		Provider                string   `json:"provider"`
+		MerchantAccount         string   `json:"merchant_account"`
+		Connector               string   `json:"connector"`
+		Region                  string   `json:"region"`
 		Enabled                 bool     `json:"enabled"`
 		SupportedCurrencies     []string `json:"supported_currencies"`
 		SupportedPaymentMethods []string `json:"supported_payment_methods"`
@@ -314,7 +398,13 @@ func decisionID(req Request, policy Policy, configuredCandidates []Candidate, de
 		sort.Strings(paymentMethods)
 		sort.Strings(operations)
 		candidates = append(candidates, canonicalCandidate{
+			ID:                      candidate.ID,
+			ConnectionRevision:      candidate.ConnectionRevision,
+			ProviderNamespaceID:     candidate.ProviderNamespaceID,
 			Provider:                candidate.Provider,
+			MerchantAccount:         candidate.MerchantAccount,
+			Connector:               candidate.Connector,
+			Region:                  candidate.Region,
 			Enabled:                 candidate.Enabled,
 			SupportedCurrencies:     currencies,
 			SupportedPaymentMethods: paymentMethods,
@@ -322,35 +412,35 @@ func decisionID(req Request, policy Policy, configuredCandidates []Candidate, de
 		})
 	}
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].Provider < candidates[j].Provider
+		return candidates[i].ID < candidates[j].ID
 	})
 
 	canonical := struct {
-		PaymentID           string               `json:"payment_id"`
-		AttemptID           string               `json:"attempt_id"`
-		MerchantID          string               `json:"merchant_id"`
-		AmountMinor         int64                `json:"amount_minor"`
-		Currency            string               `json:"currency"`
-		PaymentMethod       string               `json:"payment_method"`
-		Operation           string               `json:"operation"`
-		PolicyVersion       string               `json:"policy_version"`
-		PolicyProviderOrder []string             `json:"policy_provider_order"`
-		Candidates          []canonicalCandidate `json:"candidates"`
-		CandidateOrder      []string             `json:"candidate_order"`
-		Exclusions          []Exclusion          `json:"exclusions"`
+		PaymentID            string               `json:"payment_id"`
+		AttemptID            string               `json:"attempt_id"`
+		MerchantID           string               `json:"merchant_id"`
+		AmountMinor          int64                `json:"amount_minor"`
+		Currency             string               `json:"currency"`
+		PaymentMethod        string               `json:"payment_method"`
+		Operation            string               `json:"operation"`
+		PolicyVersion        string               `json:"policy_version"`
+		PolicyCandidateOrder []string             `json:"policy_candidate_order"`
+		Candidates           []canonicalCandidate `json:"candidates"`
+		CandidateOrder       []string             `json:"candidate_order"`
+		Exclusions           []Exclusion          `json:"exclusions"`
 	}{
-		PaymentID:           req.PaymentID,
-		AttemptID:           req.AttemptID,
-		MerchantID:          req.MerchantID,
-		AmountMinor:         req.AmountMinor,
-		Currency:            req.Currency,
-		PaymentMethod:       req.PaymentMethod,
-		Operation:           req.Operation,
-		PolicyVersion:       decision.PolicyVersion,
-		PolicyProviderOrder: append([]string(nil), policy.ProviderOrder...),
-		Candidates:          candidates,
-		CandidateOrder:      decision.CandidateOrder,
-		Exclusions:          decision.Exclusions,
+		PaymentID:            req.PaymentID,
+		AttemptID:            req.AttemptID,
+		MerchantID:           req.MerchantID,
+		AmountMinor:          req.AmountMinor,
+		Currency:             req.Currency,
+		PaymentMethod:        req.PaymentMethod,
+		Operation:            req.Operation,
+		PolicyVersion:        decision.PolicyVersion,
+		PolicyCandidateOrder: append([]string(nil), policy.CandidateOrder...),
+		Candidates:           candidates,
+		CandidateOrder:       decision.CandidateOrder,
+		Exclusions:           decision.Exclusions,
 	}
 
 	payload, err := json.Marshal(canonical)

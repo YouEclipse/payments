@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Payment Router Internal API
-  version: 0.1.0
+  version: 0.2.0
   description: |
     Internal contract for deterministic provider eligibility and static routing.
     The Router owns provider capabilities and the active policy. Callers send
@@ -50,10 +50,11 @@ paths:
   /internal/v1/routing-decisions:
     post:
       operationId: createRoutingDecision
-      summary: Select an eligible provider using a versioned static policy
+      summary: Select an eligible provider connection using a versioned static policy
       description: |
         Applies Router-owned hard eligibility constraints before Router-owned
-        static provider ordering. The response is deterministic for the same
+        static candidate ordering. Every candidate is one exact provider,
+        merchant account, connector, and region connection. The response is deterministic for the same
         context, capability snapshot, and policy version.
       security:
         - InternalServiceToken: []
@@ -174,7 +175,7 @@ components:
       additionalProperties: false
       required:
         - decision_id
-        - selected_provider
+        - selected_candidate
         - candidate_order
         - exclusions
         - policy_version
@@ -182,9 +183,8 @@ components:
         decision_id:
           type: string
           pattern: "^rtd_[a-f0-9]{24}$"
-        selected_provider:
-          type: string
-          minLength: 1
+        selected_candidate:
+          $ref: "#/components/schemas/RouteCandidate"
         candidate_order:
           type: array
           minItems: 1
@@ -193,15 +193,47 @@ components:
         exclusions:
           type: array
           items:
-            $ref: "#/components/schemas/ProviderExclusion"
+            $ref: "#/components/schemas/CandidateExclusion"
         policy_version:
           type: string
 
-    ProviderExclusion:
+    RouteCandidate:
       type: object
       additionalProperties: false
-      required: [provider, reasons]
+      required: [candidate_id, connection_revision, provider_namespace_id, provider, merchant_account, connector, region]
       properties:
+        candidate_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Stable execution identity used as provider_connection_id downstream.
+        connection_revision:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Immutable registry revision that must match the downstream Provider Gateway connection.
+        provider_namespace_id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._-]{0,127}$"
+          description: Stable conservative namespace for provider-supplied references and webhook event IDs across recovery aliases.
+        provider:
+          type: string
+          minLength: 1
+        merchant_account:
+          type: string
+          minLength: 1
+        connector:
+          type: string
+          minLength: 1
+        region:
+          type: string
+          minLength: 1
+
+    CandidateExclusion:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, provider, reasons]
+      properties:
+        candidate_id:
+          type: string
         provider:
           type: string
         reasons:
@@ -270,6 +302,6 @@ components:
           type: array
           minItems: 1
           items:
-            $ref: "#/components/schemas/ProviderExclusion"
+            $ref: "#/components/schemas/CandidateExclusion"
         policy_version:
           type: string
