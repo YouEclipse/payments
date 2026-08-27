@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"time"
@@ -48,7 +49,7 @@ func Compile(input Artifact) (*Snapshot, error) {
 		input.MaxAge <= 0 || input.MaxWindowAge <= 0 {
 		return bad("invalid window, watermark, publication time or freshness policy")
 	}
-	if !finite(input.Prior.Probability) || input.Prior.Probability < 0 || input.Prior.Probability > 1 ||
+	if !finite(input.Prior.Probability) || math.Signbit(input.Prior.Probability) || input.Prior.Probability > 1 ||
 		!finite(input.Prior.Strength) || input.Prior.Strength <= 0 || input.Prior.Strength > float64(maxExactSamples) {
 		return bad("prior must have a finite probability and positive bounded strength")
 	}

@@ -240,6 +240,7 @@ func TestPerformanceCompileRejectsAmbiguousStatisticsAndContracts(t *testing.T) 
 		"inexact sample":                  func(a *Artifact) { a.Buckets[0].SampleSize = maxExactSamples + 1 },
 		"inexact pending":                 func(a *Artifact) { a.Buckets[0].PendingCount = maxExactSamples + 1 },
 		"NaN prior":                       func(a *Artifact) { a.Prior.Probability = math.NaN() },
+		"negative zero prior":             func(a *Artifact) { a.Prior.Probability = math.Copysign(0, -1) },
 		"infinite strength":               func(a *Artifact) { a.Prior.Strength = math.Inf(1) },
 		"no strength":                     func(a *Artifact) { a.Prior.Strength = 0 },
 		"missing sample threshold":        func(a *Artifact) { a.MinSamples = a.MinSamples[:3] },

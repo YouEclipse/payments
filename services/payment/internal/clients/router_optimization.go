@@ -50,6 +50,14 @@ func versionedDecisionContentID(decision RoutingDecision) string {
 		copy := decision.SelectedCandidate
 		selected = &copy
 	}
+	optimization := decision.Optimization
+	if len(optimization) != 0 {
+		var err error
+		optimization, err = canonicalOptimizationJSON(optimization)
+		if err != nil {
+			return ""
+		}
+	}
 	canonical := struct {
 		ID                       string                 `json:"decision_id"`
 		SelectedCandidate        *RouteCandidate        `json:"selected_candidate,omitempty"`
@@ -71,13 +79,168 @@ func versionedDecisionContentID(decision RoutingDecision) string {
 	}{"", selected, decision.CandidateOrder, decision.Exclusions, decision.PolicyVersion,
 		decision.ContextSchemaVersion, decision.ContextDigest, decision.ExecutableUntil, decision.RuleSetVersion, decision.RuleSetDigest,
 		decision.CapabilityCatalogVersion, decision.CapabilityCatalogDigest, decision.RuleHits, decision.Eligibility,
-		decision.Risk, decision.Optimization, decision.ReasonCodes}
+		decision.Risk, optimization, decision.ReasonCodes}
 	payload, err := json.Marshal(canonical)
 	if err != nil {
 		return ""
 	}
 	digest := sha256.Sum256(payload)
 	return "rtd_" + hex.EncodeToString(digest[:16])
+}
+
+// canonicalOptimizationJSON reconstructs Router's typed wire representation
+// from semantic JSON. PostgreSQL jsonb deliberately does not preserve object
+// member order, so hashing the stored RawMessage bytes would detach an
+// otherwise unchanged v3 decision from its Router-issued content ID. Arrays
+// remain ordered, every field remains bound, and ambiguous JSON is rejected
+// before projection.
+func canonicalOptimizationJSON(payload []byte) ([]byte, error) {
+	if err := validateUniqueJSON(payload); err != nil {
+		return nil, errOptimizationEvidence
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	decoder.UseNumber()
+	var value any
+	if err := decoder.Decode(&value); err != nil || !validOptimizationShape(value, "optimization", 0) || !validOptimizationState(value) {
+		return nil, errOptimizationEvidence
+	}
+	result, err := appendCanonicalOptimization(nil, value, "optimization", 0)
+	if err != nil {
+		return nil, errOptimizationEvidence
+	}
+	return result, nil
+}
+
+func appendCanonicalOptimization(dst []byte, value any, shape string, depth int) ([]byte, error) {
+	if depth > 16 {
+		return nil, errOptimizationEvidence
+	}
+	if shape == "string" {
+		item, ok := value.(string)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		return appendOptimizationJSON(dst, item)
+	}
+	if strings.HasPrefix(shape, "[]") {
+		items, ok := value.([]any)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		dst = append(dst, '[')
+		for index, item := range items {
+			if index > 0 {
+				dst = append(dst, ',')
+			}
+			var err error
+			dst, err = appendCanonicalOptimization(dst, item, shape[2:], depth+1)
+			if err != nil {
+				return nil, err
+			}
+		}
+		return append(dst, ']'), nil
+	}
+	object, ok := value.(map[string]any)
+	definition, known := optimizationShapes[shape]
+	order, ordered := optimizationCanonicalFields[shape]
+	if !ok || !known || !ordered || len(order) != len(definition) {
+		return nil, errOptimizationEvidence
+	}
+	seen := make(map[string]bool, len(order))
+	for _, name := range order {
+		if seen[name] || definition[name] == "" {
+			return nil, errOptimizationEvidence
+		}
+		seen[name] = true
+	}
+	dst = append(dst, '{')
+	emitted := 0
+	for _, name := range order {
+		item, present := object[name]
+		if !present {
+			continue
+		}
+		if emitted > 0 {
+			dst = append(dst, ',')
+		}
+		var err error
+		dst, err = appendOptimizationJSON(dst, name)
+		if err != nil {
+			return nil, err
+		}
+		dst = append(dst, ':')
+		child := definition[name]
+		if child == "scalar" {
+			dst, err = appendCanonicalOptimizationScalar(dst, item, optimizationFieldKind(shape, name))
+		} else {
+			dst, err = appendCanonicalOptimization(dst, item, child, depth+1)
+		}
+		if err != nil {
+			return nil, err
+		}
+		emitted++
+	}
+	if emitted != len(object) {
+		return nil, errOptimizationEvidence
+	}
+	return append(dst, '}'), nil
+}
+
+func appendCanonicalOptimizationScalar(dst []byte, value any, kind string) ([]byte, error) {
+	switch kind {
+	case optimizationKindString:
+		item, ok := value.(string)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		return appendOptimizationJSON(dst, item)
+	case optimizationKindInteger:
+		item, ok := value.(json.Number)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		integer, err := item.Int64()
+		if err != nil {
+			return nil, errOptimizationEvidence
+		}
+		return strconv.AppendInt(dst, integer, 10), nil
+	case optimizationKindNumber:
+		item, ok := value.(json.Number)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		number, err := strconv.ParseFloat(string(item), 64)
+		if err != nil || math.IsNaN(number) || math.IsInf(number, 0) {
+			return nil, errOptimizationEvidence
+		}
+		return appendOptimizationJSON(dst, number)
+	case optimizationKindBoolean:
+		item, ok := value.(bool)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		return strconv.AppendBool(dst, item), nil
+	case optimizationKindTime:
+		item, ok := value.(string)
+		if !ok {
+			return nil, errOptimizationEvidence
+		}
+		instant, err := time.Parse(time.RFC3339Nano, item)
+		if err != nil {
+			return nil, errOptimizationEvidence
+		}
+		return appendOptimizationJSON(dst, instant.UTC().Format(time.RFC3339Nano))
+	default:
+		return nil, errOptimizationEvidence
+	}
+}
+
+func appendOptimizationJSON(dst []byte, value any) ([]byte, error) {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return append(dst, encoded...), nil
 }
 
 func validateOptimizationDecision(context routingcontext.Context, decision RoutingDecision, status int) error {
@@ -280,6 +443,23 @@ func validateOptimizationRows(rows []struct {
 // second cost or statistical model. Versioned DTO changes require reader-first
 // rollout, just like Context; strings are bounded, and arrays are bounded by
 // the already limited HTTP response size plus this per-node limit.
+var optimizationCanonicalFields = map[string][]string{
+	"optimization":         required("config_version config_digest scoring classifications"),
+	"score":                required("status mode candidate_order reason_codes profile_version profile_digest objective_version evaluated_at breakdown"),
+	"score_row":            required("candidate_id connection_revision rule_rank profile_version profile_digest cost performance numbers"),
+	"numbers":              required("succeeded_cost_micros quote_currency conservative_ppm cost_floor_micros cost_ceiling_micros clamped_cost_micros success_weight_bps cost_weight_bps success_points cost_points success_contribution cost_contribution total_points rounding_version"),
+	"cost":                 required("candidate_id connection_revision state reason_codes artifact_version artifact_digest estimate"),
+	"cost_estimate":        required("quote_currency attempt_cost_micros succeeded_cost_micros failed_cost_micros breakdown schedule_id schedule_version currency_metadata_version cross_border_rule_version evaluated_at"),
+	"cost_item":            required("scenario kind basis source_currency source_micros quote_currency amount_micros percentage_round cross_border_rule_version fx_version fx_source fx_numerator fx_denominator fx_rounding fx_as_of fx_expires_at"),
+	"performance":          required("candidate_id connection_revision state reason_codes interpretation snapshot_version snapshot_digest country_field cohort source source_segment parent_segment fallback_level window_start window_end observed_at produced_at evaluated_at estimate"),
+	"cohort":               required("payment_method operation capture_method attempt_kind outcome_definition denominator_version"),
+	"segment":              required("candidate_id connection_revision country_value network_value currency"),
+	"performance_estimate": required("probability probability_ppm conservative_probability conservative_ppm observed_lower_95 observed_upper_95 successes sample_size pending_count coverage_ppm confidence parent_probability prior_strength estimator_version interval_method_version"),
+	"classification":       required("candidate_id connection_revision state value rule country evaluated_at reason_codes"),
+	"classification_rule":  required("candidate_id connection_revision rule_version country_field counterparty_country source source_version observed_at expires_at"),
+	"observed":             required("state value source source_version observed_at expires_at"),
+}
+
 var optimizationShapes = map[string]map[string]string{
 	"optimization":         fields("config_version config_digest", map[string]string{"scoring": "score", "classifications": "[]classification"}),
 	"score":                fields("status mode profile_version profile_digest objective_version evaluated_at", map[string]string{"candidate_order": "[]string", "reason_codes": "[]string", "breakdown": "[]score_row"}),
@@ -439,10 +619,7 @@ func validOptimizationShape(value any, shape string, depth int) bool {
 }
 
 func validOptimizationFieldScalar(shape, name string, value any) bool {
-	kind := optimizationKindString
-	if fields, exists := optimizationScalarKinds[shape]; exists && fields[name] != "" {
-		kind = fields[name]
-	}
+	kind := optimizationFieldKind(shape, name)
 	switch kind {
 	case optimizationKindString:
 		item, ok := value.(string)
@@ -474,6 +651,13 @@ func validOptimizationFieldScalar(shape, name string, value any) bool {
 	default:
 		return false
 	}
+}
+
+func optimizationFieldKind(shape, name string) string {
+	if fields, exists := optimizationScalarKinds[shape]; exists && fields[name] != "" {
+		return fields[name]
+	}
+	return optimizationKindString
 }
 
 func validOptimizationState(value any) bool {

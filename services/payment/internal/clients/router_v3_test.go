@@ -175,6 +175,46 @@ func TestRouterV3ConsumesSharedRouterSuccessGoldenWithoutLoss(t *testing.T) {
 	}
 }
 
+func TestVersionedDecisionContentIDUsesOptimizationSemanticsAcrossObjectReordering(t *testing.T) {
+	decision := v3SuccessDecisionGolden(t)
+	originalOptimization := append([]byte(nil), decision.Optimization...)
+	mutateOptimizationEvidence(t, &decision, func(map[string]any) {})
+	if bytes.Equal(decision.Optimization, originalOptimization) {
+		t.Fatal("test fixture did not reorder optimization object members")
+	}
+	if !validVersionedDecisionID(decision) {
+		t.Fatal("semantic optimization evidence lost its Router decision ID after JSONB-style object reordering")
+	}
+
+	mutateOptimizationEvidence(t, &decision, func(payload map[string]any) {
+		firstOptimizationRow(t, payload)["numbers"].(map[string]any)["total_points"] = json.Number("6757")
+	})
+	if validVersionedDecisionID(decision) {
+		t.Fatal("field mutation retained the original Router decision ID")
+	}
+}
+
+func TestVersionedDecisionContentIDRejectsAmbiguousOptimizationJSON(t *testing.T) {
+	base := v3SuccessDecisionGolden(t)
+	for _, test := range []struct {
+		name    string
+		payload []byte
+	}{
+		{"duplicate member", bytes.Replace(base.Optimization, []byte(`{"config_version":`), []byte(`{"config_version":"shadow","config_version":`), 1)},
+		{"escaped duplicate member", bytes.Replace(base.Optimization, []byte(`{"config_version":`), []byte(`{"config_version":"shadow","config_\u0076ersion":`), 1)},
+		{"non-canonical case alias", bytes.Replace(base.Optimization, []byte(`"config_version"`), []byte(`"Config_version"`), 1)},
+		{"multiple values", append(append([]byte(nil), base.Optimization...), []byte(` {}`)...)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := base
+			decision.Optimization = test.payload
+			if id := versionedDecisionContentID(decision); id != "" || validVersionedDecisionID(decision) {
+				t.Fatalf("ambiguous optimization produced a decision ID %q", id)
+			}
+		})
+	}
+}
+
 func TestRouterV3RiskActionsCannotCreateAnExecutableCandidate(t *testing.T) {
 	for _, test := range []struct {
 		amount int64
