@@ -4,11 +4,13 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/YouEclipse/payments/services/payment/internal/recovery"
 )
 
 func TestSuccessfulAutomaticCaptureTransition(t *testing.T) {
 	intent, attempt, operation := preparedAggregate(t)
-	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	now := operation.CreatedAt.Add(2 * time.Hour)
 
 	if err := MarkSending(&intent, &attempt, &operation, now); err != nil {
 		t.Fatalf("mark sending: %v", err)
@@ -42,7 +44,7 @@ func TestSuccessfulAutomaticCaptureTransition(t *testing.T) {
 
 func TestUnknownBlocksNewConfirmationAndConverges(t *testing.T) {
 	intent, attempt, operation := preparedAggregate(t)
-	now := time.Date(2026, 8, 25, 12, 0, 0, 0, time.UTC)
+	now := operation.CreatedAt.Add(2 * time.Hour)
 	if err := MarkSending(&intent, &attempt, &operation, now); err != nil {
 		t.Fatal(err)
 	}
@@ -464,9 +466,32 @@ func TestManualReviewStopsAutomaticRecoveryAndPreservesFunds(t *testing.T) {
 		Status:                     OutcomeSucceeded,
 		ProviderPaymentReference:   "another_reference",
 		ProviderOperationReference: "another_reference",
+		ProviderCode:               "late_success_observed",
+		Message:                    "late success requires operator resolution",
 	}, now.Add(2*time.Second))
 	if !errors.Is(err, ErrConflictingOutcome) || !late.Conflict || intent.CapturedAmountMinor != 0 || operation.Status != OperationReviewRequired {
 		t.Fatalf("automatic outcome escaped manual review: result=%+v err=%v intent=%+v operation=%+v", late, err, intent, operation)
+	}
+	if attempt.ProviderPaymentReference != "another_reference" || operation.ProviderOperationReference != "another_reference" ||
+		operation.ProviderCode != "late_success_observed" || operation.LastError != "late success requires operator resolution" {
+		t.Fatalf("late review evidence was discarded: attempt=%+v operation=%+v", attempt, operation)
+	}
+
+	late, err = ApplyProviderOutcome(&intent, &attempt, &operation, ProviderOutcome{
+		ProviderConnectionID:       operation.ProviderConnectionID,
+		ProviderConnectionRevision: operation.ProviderConnectionRevision,
+		ProviderNamespaceID:        operation.ProviderNamespaceID,
+		Provider:                   operation.Provider,
+		Status:                     OutcomeUnknown,
+		SideEffectCertainty:        SideEffectPossible,
+		ProviderCode:               "query_timeout",
+		Message:                    "late query still has no funds answer",
+	}, now.Add(3*time.Second))
+	if !errors.Is(err, ErrConflictingOutcome) || !late.Conflict || operation.Status != OperationReviewRequired ||
+		operation.RecoveryAction != recovery.Stop || operation.RecoveryStopReason != "provider_reference_collision" ||
+		operation.RetryMode != RetryNone || operation.NextRetryAt != nil || intent.IntegrityStatus != IntegrityReviewRequired ||
+		operation.ProviderCode != "query_timeout" || operation.LastError != "late query still has no funds answer" {
+		t.Fatalf("late UNKNOWN reactivated reviewed funds work: result=%+v err=%v intent=%+v operation=%+v", late, err, intent, operation)
 	}
 }
 
@@ -522,7 +547,7 @@ func TestPrepareConfirmationRequiresMatchingExecutionIdentity(t *testing.T) {
 
 func preparedAggregate(t *testing.T) (PaymentIntent, PaymentAttempt, ProviderOperation) {
 	t.Helper()
-	now := time.Date(2026, 8, 25, 10, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	intent, err := NewIntent("pi_test", "merchant_test", "order_1", 2599, "USD", "tok_test", now)
 	if err != nil {
 		t.Fatal(err)

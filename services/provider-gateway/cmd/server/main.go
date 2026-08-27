@@ -169,7 +169,21 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 	if err != nil {
 		return gateway.Config{}, fmt.Errorf("PROVIDER_RECOVERY_ALIASES: %w", err)
 	}
-	addLegacyDevelopmentConnections(environment, providers, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases)
+	conclusiveAbsenceSpec := os.Getenv("PROVIDER_CONCLUSIVE_ABSENCE")
+	if strings.TrimSpace(conclusiveAbsenceSpec) == "" && gateway.IsDevelopmentEnvironment(environment) {
+		var defaults []string
+		for _, connectionID := range []string{"simulator_a_us_primary", "simulator_a_eu_backup"} {
+			if _, configured := providers[connectionID]; configured {
+				defaults = append(defaults, connectionID+"=true")
+			}
+		}
+		conclusiveAbsenceSpec = strings.Join(defaults, ",")
+	}
+	conclusiveAbsence, err := parseOptionalBoolMap(conclusiveAbsenceSpec)
+	if err != nil {
+		return gateway.Config{}, fmt.Errorf("PROVIDER_CONCLUSIVE_ABSENCE: %w", err)
+	}
+	addLegacyDevelopmentConnections(environment, providers, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases, conclusiveAbsence)
 	webhookBaseURL, err := requiredSetting(environment, "GATEWAY_WEBHOOK_BASE_URL", "http://127.0.0.1:8082")
 	if err != nil {
 		return gateway.Config{}, err
@@ -184,6 +198,7 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 		ProviderConnectionRevisions: connectionRevisions,
 		ProviderNamespaceIDs:        namespaceIDs,
 		ProviderRecoveryAliases:     recoveryAliases,
+		ProviderConclusiveAbsence:   conclusiveAbsence,
 		ProviderEndpoints:           providers,
 		WebhookBaseURL:              webhookBaseURL,
 		WebhookSecrets:              secrets,
@@ -193,7 +208,7 @@ func loadGatewayConfig(environment string) (gateway.Config, error) {
 	}, nil
 }
 
-func addLegacyDevelopmentConnections(environment string, endpoints, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases map[string]string) {
+func addLegacyDevelopmentConnections(environment string, endpoints, providerKinds, connectionRevisions, namespaceIDs, secrets, recoveryAliases map[string]string, conclusiveAbsence map[string]bool) {
 	if !gateway.IsDevelopmentEnvironment(environment) {
 		return
 	}
@@ -228,6 +243,9 @@ func addLegacyDevelopmentConnections(environment string, endpoints, providerKind
 	if _, exists := recoveryAliases[legacyConnection]; !exists {
 		recoveryAliases[legacyConnection] = primaryConnection
 	}
+	if _, exists := conclusiveAbsence[legacyConnection]; !exists {
+		conclusiveAbsence[legacyConnection] = conclusiveAbsence[primaryConnection]
+	}
 }
 
 func requiredSetting(environment, name, developmentDefault string) (string, error) {
@@ -256,6 +274,30 @@ func parseMap(value string) (map[string]string, error) {
 	}
 	if len(result) == 0 {
 		return nil, errors.New("at least one key=value entry is required")
+	}
+	return result, nil
+}
+
+func parseOptionalBoolMap(value string) (map[string]bool, error) {
+	result := make(map[string]bool)
+	if strings.TrimSpace(value) == "" {
+		return result, nil
+	}
+	for index, pair := range strings.Split(value, ",") {
+		key, item, ok := strings.Cut(strings.TrimSpace(pair), "=")
+		key = strings.TrimSpace(key)
+		item = strings.TrimSpace(item)
+		if !ok || key == "" || item == "" {
+			return nil, fmt.Errorf("entry %d must be key=boolean", index)
+		}
+		if _, exists := result[key]; exists {
+			return nil, fmt.Errorf("key %q appears more than once", key)
+		}
+		parsed, err := strconv.ParseBool(item)
+		if err != nil {
+			return nil, fmt.Errorf("value for %q must be a boolean: %w", key, err)
+		}
+		result[key] = parsed
 	}
 	return result, nil
 }

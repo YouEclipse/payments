@@ -14,6 +14,8 @@ type HTTPHandler struct {
 	internalToken string
 }
 
+const maxWebhookBodyBytes = 64 << 10
+
 func NewHTTPHandler(service *Service, store Store, internalToken string) http.Handler {
 	h := &HTTPHandler{service: service, store: store, internalToken: internalToken}
 	mux := http.NewServeMux()
@@ -72,15 +74,42 @@ func (h *HTTPHandler) execute(w http.ResponseWriter, r *http.Request) {
 
 func (h *HTTPHandler) get(w http.ResponseWriter, r *http.Request) {
 	reconcile := r.URL.Query().Get("reconcile") == "true"
-	op, err := h.service.Get(r.Context(), r.PathValue("operation_id"), reconcile)
+	var op Operation
+	var err error
+	if reconcile && r.URL.Query().Get("request_hash") != "" {
+		query := r.URL.Query()
+		var evidence *RecoveryEvidence
+		op, evidence, err = h.service.InspectRecovery(r.Context(), RecoveryQuery{
+			OperationID: r.PathValue("operation_id"), AttemptID: query.Get("attempt_id"),
+			ProviderConnectionID: query.Get("provider_connection_id"), ProviderConnectionRevision: query.Get("provider_connection_revision"),
+			ProviderNamespaceID: query.Get("provider_namespace_id"), Provider: query.Get("provider"),
+			ProviderIdempotencyKey: query.Get("provider_idempotency_key"), RequestHash: query.Get("request_hash"),
+		})
+		if err == nil && evidence != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{
+				"error":    map[string]string{"code": "operation_resubmit_required", "message": "fresh same-operation absence evidence is attached"},
+				"recovery": evidence,
+			})
+			return
+		}
+	} else {
+		op, err = h.service.Get(r.Context(), r.PathValue("operation_id"), reconcile)
+	}
+	if errors.Is(err, ErrIdempotencyConflict) {
+		writeError(w, http.StatusConflict, "operation_id_reused", "the query does not bind the original durable command")
+		return
+	}
+	if errors.Is(err, ErrInvalidOperation) {
+		writeError(w, http.StatusUnprocessableEntity, "operation_rejected", "the recovery identity is incomplete or invalid")
+		return
+	}
 	if errors.Is(err, ErrUnconfiguredConnection) || errors.Is(err, ErrConnectionRevisionConflict) {
 		writeError(w, http.StatusConflict, "provider_connection_identity_mismatch", err.Error())
 		return
 	}
 	if errors.Is(err, ErrResubmitRequired) {
-		// Payment owns the original tokenized request payload. A 404 on the
-		// reconcile form tells it to resubmit that exact operation; Execute then
-		// verifies the durable request hash before any provider call.
+		// Compatibility response with no proof grants no resubmission authority.
+		// Only InspectRecovery can return a validated, identity-bound envelope.
 		writeError(w, http.StatusNotFound, "operation_resubmit_required", err.Error())
 		return
 	}
@@ -96,7 +125,7 @@ func (h *HTTPHandler) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPHandler) webhook(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 256<<10))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_webhook", "webhook body is too large or unreadable")
 		return
@@ -133,16 +162,7 @@ func (h *HTTPHandler) requireInternal(next http.Handler) http.Handler {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON object")
-	}
-	return nil
+	return decodeProviderJSON(http.MaxBytesReader(w, r.Body, 64<<10), 64<<10, dst)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -32,16 +32,24 @@ type Service struct {
 	gateway         Gateway
 	logger          *slog.Logger
 	upstreamTimeout time.Duration
+	maxClockSkew    time.Duration
 	now             func() time.Time
 	contextBuilder  *routingcontext.Builder
 }
 
-var ErrInvalidRequest = errors.New("invalid payment request")
+var (
+	ErrInvalidRequest                         = errors.New("invalid payment request")
+	errRoutingAuthorityExpiredBeforeGatewayIO = errors.New("routing authority expired before first gateway I/O")
+)
 
 type Option func(*Service)
 
 func WithRoutingContext(builder *routingcontext.Builder) Option {
 	return func(service *Service) { service.contextBuilder = builder }
+}
+
+func WithMaxClockSkew(maxClockSkew time.Duration) Option {
+	return func(service *Service) { service.maxClockSkew = maxClockSkew }
 }
 
 func NewService(store *postgres.Store, router Router, gateway Gateway, logger *slog.Logger, upstreamTimeout time.Duration, options ...Option) *Service {
@@ -51,6 +59,7 @@ func NewService(store *postgres.Store, router Router, gateway Gateway, logger *s
 		gateway:         gateway,
 		logger:          logger,
 		upstreamTimeout: upstreamTimeout,
+		maxClockSkew:    500 * time.Millisecond,
 		now:             time.Now,
 	}
 	for _, option := range options {
@@ -155,12 +164,30 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 		}
 		return resultForIntent(intent, true)
 	}
+	// Replays above are read-only. A new funds path is admitted only while this
+	// process clock remains inside the PostgreSQL-witnessed safety window.
+	if err := s.store.Ready(ctx, s.maxClockSkew); err != nil {
+		return Result{}, err
+	}
 
 	intent, err := s.store.GetIntent(ctx, merchantID, intentID)
 	if err != nil {
 		return Result{}, err
 	}
 	if intent.Status != domain.IntentRequiresConfirmation {
+		// A concurrent winner can commit between the first key lookup and
+		// this read. Recheck the same command key before returning a conflict;
+		// only its durable owner may execute a funds operation.
+		lookup, err := s.store.LookupIdempotency(ctx, merchantID, key, operationName, requestHash)
+		if err != nil {
+			return Result{}, err
+		}
+		if lookup.Found {
+			if !lookup.InProgress {
+				return Result{Status: lookup.Response.Status, Body: lookup.Response.Body, Replay: true}, nil
+			}
+			return resultForIntent(intent, true)
+		}
 		return Result{}, postgres.ErrStateConflict
 	}
 	attemptID, err := identifier.New("att_")
@@ -185,11 +212,14 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 	}
 
 	var contextSnapshot, decisionSnapshot []byte
+	var routingExecutableUntil *time.Time
 	if routingRequest.Context != nil {
 		contextSnapshot, err = json.Marshal(routingRequest.Context)
 		if err != nil {
 			return Result{}, err
 		}
+		executableUntil := decision.ExecutableUntil.UTC()
+		routingExecutableUntil = &executableUntil
 		decisionSnapshot, err = json.Marshal(decision)
 		if err != nil {
 			return Result{}, err
@@ -226,6 +256,7 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 			RoutingDecisionID:          decision.DecisionID,
 			RoutingContextSnapshot:     string(contextSnapshot),
 			RoutingDecisionSnapshot:    string(decisionSnapshot),
+			RoutingExecutableUntil:     routingExecutableUntil,
 			ProviderConnectionID:       decision.SelectedCandidate.CandidateID,
 			ProviderConnectionRevision: decision.SelectedCandidate.ConnectionRevision,
 			ProviderNamespaceID:        decision.SelectedCandidate.ProviderNamespaceID,
@@ -275,7 +306,28 @@ func (s *Service) ConfirmIntent(ctx context.Context, merchantID, intentID, key s
 		}
 		return Result{}, err
 	}
-	outcome := s.executeGateway(ctx, aggregate)
+	outcome, executeErr := s.executeGateway(ctx, aggregate)
+	if errors.Is(executeErr, errRoutingAuthorityExpiredBeforeGatewayIO) {
+		persistContext, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		reviewed, stopErr := s.store.StopInitialDispatchForReview(
+			persistContext, aggregate.Operation.ID, aggregate.Operation.Version, s.now().UTC(),
+		)
+		cancel()
+		if errors.Is(stopErr, postgres.ErrRecoveryClaimLost) {
+			current, loadErr := s.store.GetIntent(ctx, merchantID, intentID)
+			if loadErr != nil {
+				return Result{}, loadErr
+			}
+			return s.finalizeResult(ctx, merchantID, key, current)
+		}
+		if stopErr != nil {
+			return Result{}, stopErr
+		}
+		return s.finalizeResult(ctx, merchantID, key, reviewed.Intent)
+	}
+	if executeErr != nil {
+		return Result{}, executeErr
+	}
 	applyResult, applyErr := s.applyOutcome(ctx, outcome)
 	if applyErr != nil && !errors.Is(applyErr, domain.ErrConflictingOutcome) {
 		return Result{}, applyErr
@@ -316,9 +368,31 @@ func (s *Service) ReceiveProviderOutcome(ctx context.Context, outcome domain.Pro
 	return publicResult, result.Duplicate, err
 }
 
-func (s *Service) executeGateway(ctx context.Context, aggregate postgres.Aggregate) domain.ProviderOutcome {
-	callContext, cancel := context.WithTimeout(ctx, s.upstreamTimeout)
+func (s *Service) executeGateway(ctx context.Context, aggregate postgres.Aggregate) (domain.ProviderOutcome, error) {
+	now := s.now().UTC()
+	callDeadline := now.Add(s.upstreamTimeout)
+	var routingDeadline *time.Time
+	if aggregate.Attempt.RoutingContextSnapshot != "" || aggregate.Attempt.RoutingDecisionSnapshot != "" {
+		if aggregate.Attempt.RoutingExecutableUntil == nil {
+			return domain.ProviderOutcome{}, errRoutingAuthorityExpiredBeforeGatewayIO
+		}
+		executableUntil := aggregate.Attempt.RoutingExecutableUntil.UTC()
+		routingDeadline = &executableUntil
+		if !now.Before(executableUntil) {
+			return domain.ProviderOutcome{}, errRoutingAuthorityExpiredBeforeGatewayIO
+		}
+		if executableUntil.Before(callDeadline) {
+			callDeadline = executableUntil
+		}
+	}
+	callContext, cancel := context.WithDeadline(ctx, callDeadline)
 	defer cancel()
+	if err := s.store.Ready(callContext, s.maxClockSkew); err != nil {
+		return domain.ProviderOutcome{}, err
+	}
+	if routingDeadline != nil && !s.now().UTC().Before(*routingDeadline) {
+		return domain.ProviderOutcome{}, errRoutingAuthorityExpiredBeforeGatewayIO
+	}
 	outcome, err := s.gateway.Execute(callContext, clients.GatewayOperationRequest{
 		OperationID:                aggregate.Operation.ID,
 		AttemptID:                  aggregate.Attempt.ID,
@@ -333,9 +407,9 @@ func (s *Service) executeGateway(ctx context.Context, aggregate postgres.Aggrega
 	})
 	if err == nil {
 		outcome.EventID = newBestEffortEventID("sync_")
-		return outcome
+		return outcome, nil
 	}
-	return gatewayFailureOutcome(aggregate, "sync_unknown_", "gateway_transport_unknown", err)
+	return gatewayFailureOutcome(aggregate, "sync_unknown_", "gateway_transport_unknown", err), nil
 }
 
 func (s *Service) queryGateway(ctx context.Context, aggregate postgres.Aggregate) domain.ProviderOutcome {
@@ -353,13 +427,9 @@ func (s *Service) queryGateway(ctx context.Context, aggregate postgres.Aggregate
 		outcome.EventID = newBestEffortEventID("query_")
 		return outcome
 	}
-	if errors.Is(err, clients.ErrGatewayOperationNotFound) {
-		// Gateway uses 404 for an operation that is absent, or was durably created
-		// but never became possibly dispatched. Resubmit the exact same operation
-		// ID, provider, key and payload; Gateway verifies its durable request hash
-		// before any call. This is not a new Attempt or cross-provider fallback.
-		return s.executeGateway(ctx, aggregate)
-	}
+	// Query is read-only with respect to funds. The reconciler validates and
+	// persists a structured absence proof before a separately budgeted claim
+	// can authorize a same-key resubmit; no HTTP 404 is an execution shortcut.
 	return gatewayFailureOutcome(aggregate, "query_unknown_", "gateway_query_unknown", err)
 }
 

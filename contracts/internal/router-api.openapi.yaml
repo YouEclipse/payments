@@ -1,12 +1,15 @@
 openapi: 3.1.0
 info:
   title: Payment Router Internal API
-  version: 0.3.0
+  version: 0.4.0
   description: |
     Reader-first internal contract. v1 retains the explicit legacy static
     interface. v2 accepts a strict versioned credential-free Context and uses
-    Router-owned immutable RuleSet and CapabilityCatalog snapshots. No endpoint
-    accepts caller-supplied policy, capabilities, credentials or payment tokens.
+    Router-owned immutable RuleSet and CapabilityCatalog snapshots. v3 adds a
+    bound routing_context.v2 Risk Decision and Router-owned, replayable cost and
+    observational-performance Optimization evidence. No endpoint accepts
+    caller-supplied policy, capabilities, credentials or payment tokens. Every
+    versioned decision carries an exclusive executable_until authority deadline.
 servers:
   - url: http://router:8081
 paths:
@@ -22,6 +25,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "405":
+          $ref: "#/components/responses/ErrorResponse"
   /readyz:
     get:
       operationId: getRouterReadiness
@@ -29,11 +34,19 @@ paths:
       security: []
       responses:
         "200":
-          description: Router is ready to accept decisions.
+          description: The API version assigned by ROUTER_REQUIRED_API_VERSION is configured and its Router-owned snapshots are currently effective.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "405":
+          $ref: "#/components/responses/ErrorResponse"
+        "503":
+          description: The snapshots required by this deployment's assigned API version are absent or outside their effective interval. Optional readers for other versions do not affect readiness.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
   /metrics:
     get:
       operationId: getRouterMetrics
@@ -134,6 +147,11 @@ paths:
         field order: context_schema_version,built_at,base,merchant,
         payment_method_context. The shared routing-context-v1.json fixture freezes
         nested field order and omission rules across Payment and Router.
+
+        A successful or negative decision includes executable_until. It is an
+        RFC3339 UTC exclusive deadline derived from the Context online window,
+        RuleSet, CapabilityCatalog and positively ordered descriptors. It is
+        evidence of short-lived first-dispatch authority, not a retry lease.
       security:
         - InternalServiceToken: []
       requestBody:
@@ -171,6 +189,73 @@ paths:
                 $ref: "#/components/schemas/NoEligibleProviderResponseV2"
         "503":
           description: routing_v2_unavailable when no v2 snapshots are installed; routing_snapshot_unavailable when the active snapshots or chosen descriptor have expired. Never retry through v1.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "500":
+          $ref: "#/components/responses/ErrorResponse"
+  /internal/v3/routing-decisions:
+    post:
+      operationId: createOptimizedRoutingDecision
+      summary: Enforce frozen Risk evidence before deterministic optimization
+      description: |
+        This explicit v3 endpoint accepts only routing_context.v2. It first runs
+        the same hard Capability and RuleSet gates as v2, then independently
+        validates and enforces the Context-bound risk_decision.v1. A non-allow
+        action can never produce a selected candidate or Optimization evidence.
+
+        When Risk allows execution and candidates remain, Router evaluates an
+        immutable fee catalog and an explicitly observational performance
+        snapshot, then applies a versioned integer scoring profile. Eligibility
+        and Risk are gates; scoring cannot restore a removed candidate. Missing
+        feature evidence follows the profile's whole-batch static_order or reject
+        action, never a per-candidate permissive fallback. The response preserves
+        complete credential-free evidence and the exact connection revision.
+
+        Request parsing, body/token/depth limits and online Context freshness are
+        identical to v2. v3 never retries through v2 or v1. executable_until is
+        the exclusive first-dispatch deadline and also incorporates Risk,
+        scoring-profile, fee/FX, performance and classification authority used by
+        the selected comparison. Payment must fail closed if that instant is not
+        still in the future immediately before the first Provider I/O.
+      security:
+        - InternalServiceToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoutingContextV2"
+      responses:
+        "200":
+          description: Risk allowed execution and Router selected one exact eligible connection using scored or declared whole-batch static-order evidence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoutingDecisionV3"
+        "400":
+          description: Context or Risk evidence is malformed, unsupported, inconsistent, expired or outside its online freshness window. Errors never echo input values or unknown keys.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorEnvelope"
+        "401":
+          $ref: "#/components/responses/ErrorResponse"
+        "405":
+          $ref: "#/components/responses/ErrorResponse"
+        "413":
+          $ref: "#/components/responses/ErrorResponse"
+        "415":
+          $ref: "#/components/responses/ErrorResponse"
+        "422":
+          description: Risk blocked, requires unsupported authentication or manual review; hard gates left no candidate; or the scoring profile rejected unavailable evidence. No winner is present and candidate_order is empty.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoEligibleProviderResponseV3"
+        "503":
+          description: routing_v3_unavailable when no v3 snapshots are installed; routing_snapshot_unavailable when required authority expired during admission or evaluation. Never retry through v2 or v1.
           content:
             application/json:
               schema:
@@ -303,6 +388,77 @@ components:
               $ref: "#/components/schemas/Observed"
               description: Non-secret compatibility domain supplied by a trusted metadata owner. A token string, token prefix or PSP brand is not evidence of portability. Unknown/stale closes capability eligibility.
 
+    RoutingContextV2:
+      type: object
+      additionalProperties: false
+      required: [context_schema_version, built_at, base, merchant, payment_method_context, risk]
+      properties:
+        context_schema_version:
+          type: string
+          const: routing_context.v2
+        built_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        base:
+          allOf:
+            - $ref: "#/components/schemas/ContextBase"
+            - properties:
+                operation:
+                  const: sale
+                capture_method:
+                  const: automatic
+          description: v3 Optimization currently accepts only the first card SALE/automatic slice.
+        merchant:
+          type: object
+          additionalProperties: false
+          required: [entity_id, country]
+          properties:
+            entity_id:
+              $ref: "#/components/schemas/ContextIdentifier"
+            country:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    state:
+                      const: known
+                    value:
+                      type: string
+                      pattern: '^[A-Z]{2}$'
+              description: Explicit known merchant-profile country; never inferred from card, currency or provider region.
+        payment_method_context:
+          type: object
+          additionalProperties: false
+          required: [category, network, issuer_country, credential_domain]
+          properties:
+            category:
+              type: string
+              const: card
+              description: Must equal base.payment_method; never a credential.
+            network:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    value:
+                      type: string
+                      enum: [visa, mastercard, amex, discover, jcb, unionpay, diners]
+            issuer_country:
+              allOf:
+                - $ref: "#/components/schemas/Observed"
+                - properties:
+                    value:
+                      type: string
+                      pattern: '^[A-Z]{2}$'
+            credential_domain:
+              $ref: "#/components/schemas/Observed"
+              description: Non-secret compatibility domain supplied by a trusted metadata owner. It never contains a token, PAN, credential or secret.
+        risk:
+          $ref: "#/components/schemas/RiskDecision"
+      description: |
+        The Risk Decision is produced by Payment's configured authorized source,
+        not by the merchant and not by Router. Its subject_digest binds the base,
+        merchant and payment_method_context projection (including provenance),
+        while the full Context digest also binds built_at and the Risk Decision.
+        Risk evaluated_at cannot follow built_at and expires_at is exclusive.
+
     ContextBase:
       type: object
       additionalProperties: false
@@ -345,13 +501,121 @@ components:
               const: manual
       description: Payment currently emits sale/automatic. Router also represents initial authorize/manual, not a follow-on capture/void/refund route and not proof that Payment implements authorization lifecycles.
 
+    RiskDecision:
+      type: object
+      additionalProperties: false
+      required: [schema_version, decision_id, subject_digest, action, reason_codes, version, source, evaluated_at, expires_at]
+      properties:
+        schema_version:
+          type: string
+          const: risk_decision.v1
+        decision_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        subject_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        action:
+          type: string
+          enum: [allow, block, require_3ds, manual_review]
+        reason_codes:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+          description: Canonically sorted. Non-allow actions require at least one reason.
+        version:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        source:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        evaluated_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        expires_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+      oneOf:
+        - properties:
+            action: {const: allow}
+        - properties:
+            action:
+              enum: [block, require_3ds, manual_review]
+            reason_codes:
+              minItems: 1
+      description: Credential-free decision from an authorized Risk source. subject_digest is risk_subject.v1 and expiry is a half-open authority boundary.
+
+    RiskEvidence:
+      type: object
+      additionalProperties: false
+      required: [decision_id, decision_digest, version, action, outcome, continue, reason_codes, required_capabilities]
+      properties:
+        decision_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        decision_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        version:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        action:
+          type: string
+          enum: [allow, block, require_3ds, manual_review]
+        outcome:
+          type: string
+          enum: [allowed, blocked, authentication_unsupported, requires_review]
+        continue:
+          type: boolean
+        reason_codes:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z][a-z0-9_]{0,63}$'
+        required_capabilities:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            enum: [3ds_required]
+      oneOf:
+        - properties:
+            action: {const: allow}
+            outcome: {const: allowed}
+            continue: {const: true}
+            required_capabilities: {maxItems: 0}
+        - properties:
+            action: {const: block}
+            outcome: {const: blocked}
+            continue: {const: false}
+            reason_codes: {minItems: 1}
+            required_capabilities: {maxItems: 0}
+        - properties:
+            action: {const: manual_review}
+            outcome: {const: requires_review}
+            continue: {const: false}
+            reason_codes: {minItems: 1}
+            required_capabilities: {maxItems: 0}
+        - properties:
+            action: {const: require_3ds}
+            outcome: {const: authentication_unsupported}
+            continue: {const: false}
+            reason_codes: {minItems: 1}
+            required_capabilities:
+              minItems: 1
+              maxItems: 1
+              prefixItems:
+                - const: 3ds_required
+      description: Router enforcement of the exact Risk Decision. The current SALE slice has no 3DS execution path, so require_3ds is non-executable.
+
     ArtifactDigest:
       type: string
       pattern: '^sha256:[a-f0-9]{64}$'
 
     RoutingEvidenceV2:
       type: object
-      required: [decision_id, candidate_order, exclusions, policy_version, context_schema_version, context_digest, rule_set_version, rule_set_digest, capability_catalog_version, capability_catalog_digest, rule_hits, eligibility, reason_codes]
+      required: [decision_id, candidate_order, exclusions, policy_version, context_schema_version, context_digest, executable_until, rule_set_version, rule_set_digest, capability_catalog_version, capability_catalog_digest, rule_hits, eligibility, reason_codes]
       properties:
         decision_id:
           type: string
@@ -375,6 +639,10 @@ components:
           const: routing_context.v1
         context_digest:
           $ref: "#/components/schemas/ArtifactDigest"
+        executable_until:
+          allOf:
+            - $ref: "#/components/schemas/CanonicalInstant"
+          description: Exclusive first-dispatch authority deadline. A consumer must observe now < executable_until; it is not a recovery or retry lease.
         rule_set_version:
           $ref: "#/components/schemas/ContextIdentifier"
         rule_set_digest:
@@ -433,6 +701,781 @@ components:
               maxItems: 0
               items:
                 type: string
+
+    RoutingEvidenceV3:
+      type: object
+      required: [decision_id, candidate_order, exclusions, policy_version, context_schema_version, context_digest, executable_until, rule_set_version, rule_set_digest, capability_catalog_version, capability_catalog_digest, rule_hits, eligibility, risk, reason_codes]
+      properties:
+        decision_id:
+          type: string
+          pattern: '^rtd_[a-f0-9]{32}$'
+          description: Content-derived identifier over the complete decision envelope except the HTTP error field.
+        candidate_order:
+          type: array
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+          description: Exact eligible connection IDs after hard rules, Risk and (when present) Optimization. It never authorizes switching an existing funds operation.
+        exclusions:
+          type: array
+          items:
+            $ref: "#/components/schemas/CandidateExclusionV2"
+        policy_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+          description: Compatibility field exactly equal to rule_set_version.
+        context_schema_version:
+          type: string
+          const: routing_context.v2
+        context_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        executable_until:
+          allOf:
+            - $ref: "#/components/schemas/CanonicalInstant"
+          description: Exclusive first-dispatch authority deadline, shortened by every Context, Risk, Router artifact and feature authority used by this decision. It is not extended during recovery.
+        rule_set_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        rule_set_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        capability_catalog_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        capability_catalog_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        rule_hits:
+          type: array
+          items:
+            $ref: "#/components/schemas/RuleHit"
+        eligibility:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/EligibilityEvidence"
+        risk:
+          $ref: "#/components/schemas/RiskEvidence"
+        optimization:
+          $ref: "#/components/schemas/OptimizationResult"
+        reason_codes:
+          type: array
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+
+    RoutingDecisionV3:
+      type: object
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/RoutingEvidenceV3"
+        - required: [selected_candidate, optimization]
+          properties:
+            selected_candidate:
+              $ref: "#/components/schemas/RouteCandidate"
+            candidate_order:
+              type: array
+              minItems: 1
+              items:
+                type: string
+            risk:
+              allOf:
+                - $ref: "#/components/schemas/RiskEvidence"
+                - properties:
+                    action: {const: allow}
+                    outcome: {const: allowed}
+                    continue: {const: true}
+            optimization:
+              allOf:
+                - $ref: "#/components/schemas/OptimizationResult"
+                - properties:
+                    scoring:
+                      allOf:
+                        - $ref: "#/components/schemas/ScoringResult"
+                        - properties:
+                            status:
+                              enum: [scored, static_fallback]
+                            mode:
+                              enum: [full_v1, static_order]
+                            candidate_order:
+                              minItems: 1
+      description: selected_candidate equals candidate_order[0], and Optimization scoring candidate_order equals the top-level candidate_order.
+
+    NoEligibleProviderResponseV3:
+      type: object
+      unevaluatedProperties: false
+      allOf:
+        - $ref: "#/components/schemas/RoutingEvidenceV3"
+        - required: [error]
+          properties:
+            error:
+              allOf:
+                - $ref: "#/components/schemas/APIError"
+                - properties:
+                    code:
+                      const: no_eligible_provider
+            candidate_order:
+              type: array
+              maxItems: 0
+              items:
+                type: string
+        - oneOf:
+            - properties:
+                risk:
+                  allOf:
+                    - $ref: "#/components/schemas/RiskEvidence"
+                    - properties:
+                        continue: {const: false}
+                optimization: false
+            - properties:
+                risk:
+                  allOf:
+                    - $ref: "#/components/schemas/RiskEvidence"
+                    - properties:
+                        action: {const: allow}
+                        outcome: {const: allowed}
+                        continue: {const: true}
+                optimization: false
+            - required: [optimization]
+              properties:
+                risk:
+                  allOf:
+                    - $ref: "#/components/schemas/RiskEvidence"
+                    - properties:
+                        action: {const: allow}
+                        outcome: {const: allowed}
+                        continue: {const: true}
+                optimization:
+                  allOf:
+                    - $ref: "#/components/schemas/OptimizationResult"
+                    - properties:
+                        scoring:
+                          allOf:
+                            - $ref: "#/components/schemas/ScoringResult"
+                            - properties:
+                                status: {const: rejected}
+                                mode: {const: reject}
+                                candidate_order: {maxItems: 0}
+      description: |
+        A non-allow Risk action omits optimization. Risk allow with no hard-gate
+        candidate also omits optimization. A scoring-profile reject includes
+        optimization with scoring.status=rejected and mode=reject. All variants
+        preserve Risk and the exclusive executable_until evidence but cannot be
+        dispatched.
+
+    OptimizationResult:
+      type: object
+      additionalProperties: false
+      required: [config_version, config_digest, scoring, classifications]
+      properties:
+        config_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        config_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        scoring:
+          $ref: "#/components/schemas/ScoringResult"
+        classifications:
+          type: array
+          minItems: 1
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/CrossBorderEvidence"
+      description: Immutable comparison evidence. Feature candidate/revision manifests are compiled to exactly match the CapabilityCatalog; no credential, token, PAN or arbitrary debug field is permitted.
+
+    ScoringResult:
+      type: object
+      additionalProperties: false
+      required: [status, mode, candidate_order, reason_codes, profile_version, profile_digest, objective_version, evaluated_at, breakdown]
+      properties:
+        status:
+          type: string
+          enum: [scored, static_fallback, rejected]
+        mode:
+          type: string
+          enum: [full_v1, static_order, reject]
+        candidate_order:
+          type: array
+          uniqueItems: true
+          maxItems: 128
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        reason_codes:
+          type: array
+          minItems: 1
+          maxItems: 128
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        profile_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        profile_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        objective_version:
+          type: string
+          const: conservative_success_and_success_scenario_cost.v1
+        evaluated_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        breakdown:
+          type: array
+          maxItems: 128
+          items:
+            $ref: "#/components/schemas/ScoreBreakdown"
+      oneOf:
+        - properties:
+            status: {const: scored}
+            mode: {const: full_v1}
+            candidate_order: {minItems: 1}
+            breakdown:
+              minItems: 1
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/ScoreBreakdown"
+                  - required: [numbers]
+        - properties:
+            status: {const: static_fallback}
+            mode: {const: static_order}
+            candidate_order: {minItems: 1}
+            breakdown:
+              minItems: 1
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/ScoreBreakdown"
+                  - properties:
+                      numbers: false
+        - properties:
+            status: {const: rejected}
+            mode: {const: reject}
+            candidate_order: {maxItems: 0}
+            breakdown:
+              minItems: 1
+              items:
+                allOf:
+                  - $ref: "#/components/schemas/ScoreBreakdown"
+                  - properties:
+                      numbers: false
+      description: |
+        full_v1 combines separate conservative-success and succeeded-cost
+        objectives using bounded integer points. static_order is a declared
+        whole-batch abstention when at least one required feature stage is
+        unavailable. reject yields no executable candidate. It is never a
+        causal-uplift estimate or expected utility.
+
+    ScoreBreakdown:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, rule_rank, profile_version, profile_digest, cost, performance]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        rule_rank:
+          type: integer
+          minimum: 0
+          maximum: 127
+        profile_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        profile_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        cost:
+          $ref: "#/components/schemas/CostResult"
+        performance:
+          $ref: "#/components/schemas/PerformanceResult"
+        numbers:
+          $ref: "#/components/schemas/ScoreNumbers"
+
+    ScoreNumbers:
+      type: object
+      additionalProperties: false
+      required: [succeeded_cost_micros, quote_currency, conservative_ppm, cost_floor_micros, cost_ceiling_micros, clamped_cost_micros, success_weight_bps, cost_weight_bps, success_points, cost_points, success_contribution, cost_contribution, total_points, rounding_version]
+      properties:
+        succeeded_cost_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        quote_currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        conservative_ppm:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000
+        cost_floor_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        cost_ceiling_micros:
+          type: integer
+          format: int64
+          minimum: 1
+        clamped_cost_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        success_weight_bps:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        cost_weight_bps:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        success_points:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        cost_points:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        success_contribution:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        cost_contribution:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        total_points:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000
+        rounding_version:
+          type: string
+          const: success_half_up_cost_floor_contribution_floor.v1
+
+    CostResult:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, state, reason_codes, artifact_version, artifact_digest]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        state:
+          type: string
+          enum: [known, unknown, stale]
+        reason_codes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        artifact_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        artifact_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        estimate:
+          $ref: "#/components/schemas/CostEstimate"
+      oneOf:
+        - properties:
+            state: {const: known}
+          required: [estimate]
+        - properties:
+            state:
+              enum: [unknown, stale]
+            estimate: false
+      description: A zero amount never stands in for unavailable evidence. Only state=known carries an estimate.
+
+    CostEstimate:
+      type: object
+      additionalProperties: false
+      required: [quote_currency, attempt_cost_micros, succeeded_cost_micros, failed_cost_micros, breakdown, schedule_id, schedule_version, currency_metadata_version, evaluated_at]
+      properties:
+        quote_currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        attempt_cost_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        succeeded_cost_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        failed_cost_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        breakdown:
+          type: array
+          minItems: 6
+          maxItems: 9
+          items:
+            $ref: "#/components/schemas/CostBreakdownItem"
+        schedule_id:
+          $ref: "#/components/schemas/ContextIdentifier"
+        schedule_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        currency_metadata_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        cross_border_rule_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        evaluated_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+      description: succeeded_cost_micros and failed_cost_micros each include attempt_cost_micros; they are contractual scenarios, not actual settled cost or a probability-weighted expectation.
+
+    CostBreakdownItem:
+      type: object
+      additionalProperties: false
+      required: [scenario, kind, basis, source_currency, source_micros, quote_currency, amount_micros]
+      dependentRequired:
+        fx_version: [fx_source, fx_numerator, fx_denominator, fx_rounding, fx_as_of, fx_expires_at]
+        fx_source: [fx_version, fx_numerator, fx_denominator, fx_rounding, fx_as_of, fx_expires_at]
+        fx_numerator: [fx_version, fx_source, fx_denominator, fx_rounding, fx_as_of, fx_expires_at]
+        fx_denominator: [fx_version, fx_source, fx_numerator, fx_rounding, fx_as_of, fx_expires_at]
+        fx_rounding: [fx_version, fx_source, fx_numerator, fx_denominator, fx_as_of, fx_expires_at]
+        fx_as_of: [fx_version, fx_source, fx_numerator, fx_denominator, fx_rounding, fx_expires_at]
+        fx_expires_at: [fx_version, fx_source, fx_numerator, fx_denominator, fx_rounding, fx_as_of]
+      properties:
+        scenario:
+          type: string
+          enum: [attempt, success_only, failure_only]
+        kind:
+          type: string
+          enum: [fixed, variable, cross_border]
+        basis:
+          type: string
+          enum: [contract_fixed, payment_amount_bps, classified_payment_amount_bps]
+        source_currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        source_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        quote_currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+        amount_micros:
+          type: integer
+          format: int64
+          minimum: 0
+        percentage_round:
+          type: string
+          enum: [down, half_up, up]
+        cross_border_rule_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        fx_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        fx_source:
+          $ref: "#/components/schemas/ContextIdentifier"
+        fx_numerator:
+          type: integer
+          format: int64
+          minimum: 1
+        fx_denominator:
+          type: integer
+          format: int64
+          minimum: 1
+        fx_rounding:
+          type: string
+          enum: [down, half_up, up]
+        fx_as_of:
+          $ref: "#/components/schemas/CanonicalInstant"
+        fx_expires_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+      oneOf:
+        - properties:
+            kind: {const: fixed}
+            basis: {const: contract_fixed}
+            percentage_round: false
+            cross_border_rule_version: false
+        - properties:
+            kind: {const: variable}
+            basis: {const: payment_amount_bps}
+            cross_border_rule_version: false
+          required: [percentage_round]
+        - properties:
+            kind: {const: cross_border}
+            basis: {const: classified_payment_amount_bps}
+          required: [percentage_round, cross_border_rule_version]
+      description: Foreign-currency rows carry the complete directed FX quote fields; Router never guesses an inverse or a 1:1 rate.
+
+    PerformanceResult:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, state, reason_codes, interpretation, snapshot_version, snapshot_digest, country_field, cohort, source, fallback_level, window_start, window_end, observed_at, produced_at, evaluated_at]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        state:
+          type: string
+          enum: [known, prior, unknown, stale]
+        reason_codes:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        interpretation:
+          type: string
+          const: historical_policy_conditional_not_causal
+        snapshot_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        snapshot_digest:
+          $ref: "#/components/schemas/ArtifactDigest"
+        country_field:
+          type: string
+          enum: [merchant.country, payment_method_context.issuer_country]
+        cohort:
+          $ref: "#/components/schemas/PerformanceCohort"
+        source:
+          type: string
+          enum: [bucket, global_prior, none]
+        source_segment:
+          $ref: "#/components/schemas/PerformanceSegment"
+        parent_segment:
+          $ref: "#/components/schemas/PerformanceSegment"
+        fallback_level:
+          type: integer
+          minimum: -1
+          maximum: 4
+        window_start:
+          $ref: "#/components/schemas/CanonicalInstant"
+        window_end:
+          $ref: "#/components/schemas/CanonicalInstant"
+        observed_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        produced_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        evaluated_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        estimate:
+          $ref: "#/components/schemas/PerformanceEstimate"
+      oneOf:
+        - properties:
+            state: {const: known}
+            source: {const: bucket}
+            fallback_level: {minimum: 0, maximum: 3}
+          required: [source_segment, estimate]
+        - properties:
+            state: {const: prior}
+            source: {const: global_prior}
+            fallback_level: {const: 4}
+            source_segment: false
+            parent_segment: false
+          required: [estimate]
+        - properties:
+            state:
+              enum: [unknown, stale]
+            source: {const: none}
+            fallback_level: {const: -1}
+            source_segment: false
+            parent_segment: false
+            estimate: false
+      description: Historical evidence under the declared routing policy and cohort. It is observational, not causal uplift or a promise of future authorization.
+
+    PerformanceCohort:
+      type: object
+      additionalProperties: false
+      required: [payment_method, operation, capture_method, attempt_kind, outcome_definition, denominator_version]
+      properties:
+        payment_method:
+          type: string
+          const: card
+        operation:
+          type: string
+          const: sale
+        capture_method:
+          type: string
+          const: automatic
+        attempt_kind:
+          type: string
+          const: first
+        outcome_definition:
+          type: string
+          const: sale_first_attempt_completion.v1
+        denominator_version:
+          type: string
+          const: finalized_logical_operation.v1
+
+    PerformanceSegment:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, country_value, network_value, currency]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        country_value:
+          type: string
+          pattern: '^(\*|[A-Z]{2})$'
+        network_value:
+          type: string
+          pattern: '^(\*|visa|mastercard|amex|discover|jcb|unionpay|diners)$'
+        currency:
+          type: string
+          pattern: '^(\*|[A-Z]{3})$'
+
+    PerformanceEstimate:
+      type: object
+      additionalProperties: false
+      required: [probability, probability_ppm, conservative_probability, conservative_ppm, observed_lower_95, observed_upper_95, successes, sample_size, pending_count, coverage_ppm, confidence, parent_probability, prior_strength, estimator_version, interval_method_version]
+      properties:
+        probability:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        probability_ppm:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000
+        conservative_probability:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        conservative_ppm:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000
+        observed_lower_95:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        observed_upper_95:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        successes:
+          type: integer
+          minimum: 0
+        sample_size:
+          type: integer
+          minimum: 0
+        pending_count:
+          type: integer
+          minimum: 0
+        coverage_ppm:
+          type: integer
+          minimum: 0
+          maximum: 1000000
+        confidence:
+          type: string
+          enum: [high, medium, low, prior_only]
+        parent_probability:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+        prior_strength:
+          type: number
+          format: double
+          minimum: 0
+        estimator_version:
+          type: string
+          const: parent_shrinkage_wilson95.v1
+        interval_method_version:
+          type: string
+          const: observed_binomial_wilson95.v1
+      description: observed_lower_95 and observed_upper_95 are Wilson intervals for raw observations, not a posterior or causal confidence interval.
+
+    CrossBorderEvidence:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, state, evaluated_at, reason_codes]
+      dependentRequired:
+        rule: [country]
+        country: [rule]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        state:
+          type: string
+          enum: [known, unknown, stale, not_applicable]
+        value:
+          type: boolean
+        rule:
+          $ref: "#/components/schemas/CrossBorderRule"
+        country:
+          $ref: "#/components/schemas/Observed"
+        evaluated_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        reason_codes:
+          type: array
+          maxItems: 32
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+      oneOf:
+        - properties:
+            state: {const: known}
+          required: [value, rule, country]
+        - properties:
+            state: {const: unknown}
+            value: false
+        - properties:
+            state: {const: stale}
+            value: false
+          required: [rule, country]
+        - properties:
+            state: {const: not_applicable}
+            value: false
+            rule: false
+            country: false
+      description: Named classification provenance. Country inequality is never guessed by the cost evaluator, and unknown or stale never means domestic.
+
+    CrossBorderRule:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, connection_revision, rule_version, country_field, counterparty_country, source, source_version, observed_at, expires_at]
+      properties:
+        candidate_id:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        connection_revision:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9._-]{0,127}$'
+        rule_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        country_field:
+          type: string
+          enum: [merchant.country, payment_method_context.issuer_country]
+        counterparty_country:
+          type: string
+          pattern: '^[A-Z]{2}$'
+        source:
+          $ref: "#/components/schemas/ContextIdentifier"
+        source_version:
+          $ref: "#/components/schemas/ContextIdentifier"
+        observed_at:
+          $ref: "#/components/schemas/CanonicalInstant"
+        expires_at:
+          $ref: "#/components/schemas/CanonicalInstant"
 
     RoutingReasonV2:
       type: object

@@ -53,7 +53,7 @@ func TestRoutingEvidencePersistsBeforeDispatchAndCannotBeRewritten(t *testing.T)
 	if loaded.Operation.Status != domain.OperationCreated {
 		t.Fatalf("unexpected dispatch before verification: %s", loaded.Operation.Status)
 	}
-	if err := validateRoutingEvidence(loaded.Attempt, loaded.Intent); err != nil {
+	if err := validateRoutingEvidence(loaded.Attempt, loaded.Intent, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	var original, restored routingcontext.Context
@@ -77,6 +77,7 @@ func TestRoutingEvidencePersistsBeforeDispatchAndCannotBeRewritten(t *testing.T)
 	for _, query := range []string{
 		`UPDATE payment_attempts SET routing_context_snapshot=jsonb_set(routing_context_snapshot,'{base,amount_minor}','9999') WHERE id=$1`,
 		`UPDATE payment_attempts SET routing_decision_snapshot=jsonb_set(routing_decision_snapshot,'{reason_codes}','["rewritten"]') WHERE id=$1`,
+		`UPDATE payment_attempts SET routing_executable_until=routing_executable_until + interval '1 second' WHERE id=$1`,
 		`UPDATE payment_attempts SET routing_context_snapshot=NULL,routing_decision_snapshot=NULL WHERE id=$1`,
 	} {
 		_, err := pool.Exec(ctx, query, attempt.ID)

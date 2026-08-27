@@ -23,6 +23,7 @@ type Config struct {
 	ProviderConnectionRevisions map[string]string
 	ProviderNamespaceIDs        map[string]string
 	ProviderRecoveryAliases     map[string]string
+	ProviderConclusiveAbsence   map[string]bool
 	ProviderEndpoints           map[string]string
 	WebhookBaseURL              string
 	WebhookSecrets              map[string]string
@@ -95,6 +96,7 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 	cfg.ProviderConnectionRevisions = cloneStringMap(cfg.ProviderConnectionRevisions)
 	cfg.ProviderNamespaceIDs = cloneStringMap(cfg.ProviderNamespaceIDs)
 	cfg.ProviderRecoveryAliases = cloneStringMap(cfg.ProviderRecoveryAliases)
+	cfg.ProviderConclusiveAbsence = cloneBoolMap(cfg.ProviderConclusiveAbsence)
 	cfg.ProviderEndpoints = cloneStringMap(cfg.ProviderEndpoints)
 	cfg.WebhookSecrets = cloneStringMap(cfg.WebhookSecrets)
 	if len(cfg.ProviderEndpoints) == 0 {
@@ -121,6 +123,9 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 		if err != nil {
 			return nil, fmt.Errorf("provider connection %q endpoint: %w", connectionID, err)
 		}
+		if !IsDevelopmentEnvironment(cfg.Environment) && !strings.HasPrefix(normalizedEndpoint, "https://") {
+			return nil, fmt.Errorf("provider connection %q endpoint must use HTTPS outside local, development, and test environments", connectionID)
+		}
 		cfg.ProviderEndpoints[connectionID] = normalizedEndpoint
 		if !IsDevelopmentEnvironment(cfg.Environment) && strings.HasPrefix(strings.ToLower(provider), "simulator") {
 			return nil, errors.New("simulator providers are forbidden outside local, development, and test environments")
@@ -134,6 +139,7 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 		}
 		configuredRevisions[connectionID] = connectionRevisionBinding(
 			configuredConnections[connectionID], normalizedEndpoint, cfg.WebhookSecrets[connectionID],
+			cfg.ProviderConclusiveAbsence[connectionID],
 		)
 	}
 	for mapName, configured := range map[string]map[string]string{
@@ -146,6 +152,11 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 			if _, exists := cfg.ProviderEndpoints[connectionID]; !exists {
 				return nil, fmt.Errorf("%s configures unknown provider connection %q", mapName, connectionID)
 			}
+		}
+	}
+	for connectionID := range cfg.ProviderConclusiveAbsence {
+		if _, exists := cfg.ProviderEndpoints[connectionID]; !exists {
+			return nil, fmt.Errorf("PROVIDER_CONCLUSIVE_ABSENCE configures unknown provider connection %q", connectionID)
 		}
 	}
 	for aliasConnectionID, targetConnectionID := range cfg.ProviderRecoveryAliases {
@@ -169,9 +180,11 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 			return nil, fmt.Errorf("provider recovery alias %q cannot target another alias", aliasConnectionID)
 		}
 	}
-	if cfg.WebhookBaseURL == "" {
-		return nil, errors.New("webhook base URL is required")
+	webhookBaseURL, err := normalizeGatewayURL(cfg.WebhookBaseURL, !IsDevelopmentEnvironment(cfg.Environment))
+	if err != nil {
+		return nil, fmt.Errorf("webhook base URL: %w", err)
 	}
+	cfg.WebhookBaseURL = webhookBaseURL
 	if !IsDevelopmentEnvironment(cfg.Environment) {
 		if strings.TrimSpace(cfg.InternalToken) == "" {
 			return nil, errors.New("internal service token is required outside local, development, and test environments")
@@ -179,6 +192,13 @@ func NewService(cfg Config, store Store, log *slog.Logger) (*Service, error) {
 		if strings.TrimSpace(cfg.PaymentOutcomeURL) == "" {
 			return nil, errors.New("payment outcome URL is required outside local, development, and test environments")
 		}
+	}
+	if cfg.PaymentOutcomeURL != "" {
+		paymentOutcomeURL, err := normalizeGatewayURL(cfg.PaymentOutcomeURL, !IsDevelopmentEnvironment(cfg.Environment))
+		if err != nil {
+			return nil, fmt.Errorf("payment outcome URL: %w", err)
+		}
+		cfg.PaymentOutcomeURL = paymentOutcomeURL
 	}
 	validationCtx, cancel := context.WithTimeout(context.Background(), durableStoreTimeout)
 	defer cancel()
@@ -283,16 +303,28 @@ func (s *Service) dispatch(ctx context.Context, req OperationRequest, op Operati
 	if !operationRequestIdentityMatches(op, req) {
 		return Operation{}, ErrIdempotencyConflict
 	}
-	if _, err := s.setStatusDurably(ctx, op.OperationID, StatusSending, "possible", "", ""); err != nil {
+	if !time.Now().UTC().Before(op.CreatedAt.Add(localRecoveryWindow)) {
+		return s.setStatusDurably(ctx, op.OperationID, StatusReview, "possible", "", "local_recovery_window_exhausted")
+	}
+	marked, claimed, err := s.claimDispatchDurably(ctx, op)
+	if err != nil {
 		return Operation{}, err
 	}
+	// Seeing Sending is not ownership: another worker may hold that state. Only
+	// the compare-and-swap winner may cross the Provider boundary.
+	if !claimed {
+		return marked, nil
+	}
+	op = marked
 
 	providerCtx, cancel := context.WithTimeout(ctx, s.cfg.ProviderTimeout)
 	defer cancel()
 	result, err := s.sale(providerCtx, req, op)
 	if err != nil {
 		// Once dispatch may have crossed the process boundary, transport errors are not proof of failure.
-		return s.setStatusDurably(ctx, op.OperationID, StatusUnknown, "possible", "", "provider_response_unknown")
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, &op,
+			providerCallErrorObservation(op.OperationID, ObservationSourceSale, "provider_response_unknown", err))
+		return current, storeErr
 	}
 	if err := validateProviderResponseIdentity(result, req.Provider, req.OperationID); err != nil {
 		s.log.Error("provider sale response identity mismatch",
@@ -301,13 +333,32 @@ func (s *Service) dispatch(ctx context.Context, req OperationRequest, op Operati
 			"response_operation_id", result.OperationID,
 			"response_provider", result.Provider,
 		)
-		return s.setStatusDurably(ctx, op.OperationID, StatusReview, "possible", "", "provider_response_identity_mismatch")
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, nil, providerResponseObservation(
+			op.OperationID, ObservationSourceSale, result, StatusReview, "possible", "", "provider_response_identity_mismatch",
+		))
+		return current, storeErr
 	}
 	status, certainty, failureCode := normalizeProviderResult(result.Status, result.ProviderReference, result.FailureCode)
-	return s.setStatusDurably(ctx, op.OperationID, status, certainty, result.ProviderReference, failureCode)
+	if status == StatusUnknown {
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, &op, providerResponseObservation(
+			op.OperationID, ObservationSourceSale, result, status, certainty, result.ProviderReference, failureCode,
+		))
+		return current, storeErr
+	}
+	current, _, storeErr := s.applyProviderObservationDurably(ctx, nil, providerResponseObservation(
+		op.OperationID, ObservationSourceSale, result, status, certainty, result.ProviderReference, failureCode,
+	))
+	return current, storeErr
 }
 
 func (s *Service) reconcileBeforeResubmit(ctx context.Context, req OperationRequest, op Operation) (Operation, error) {
+	inFlight, err := s.store.DispatchInFlight(ctx, op.OperationID)
+	if err != nil {
+		return Operation{}, err
+	}
+	if inFlight {
+		return op, nil
+	}
 	result, err := s.queryProviderWithTimeout(ctx, op)
 	if errors.Is(err, ErrUnconfiguredConnection) {
 		return Operation{}, err
@@ -316,12 +367,18 @@ func (s *Service) reconcileBeforeResubmit(ctx context.Context, req OperationRequ
 		// A conclusive provider-side not-found permits resubmitting only the exact
 		// same logical operation. CreateOrGet already verified the full request
 		// hash, including provider, token, amount and capture method.
-		return s.dispatch(ctx, req, op)
+		current, applied, storeErr := s.applyProviderObservationDurably(ctx, &op, providerAbsenceObservation(op.OperationID))
+		if storeErr != nil || !applied {
+			return current, storeErr
+		}
+		return s.dispatch(ctx, req, current)
 	}
 	if err != nil {
-		return s.setStatusDurably(ctx, op.OperationID, StatusUnknown, "possible", "", "provider_query_unknown")
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, &op,
+			providerCallErrorObservation(op.OperationID, ObservationSourceQuery, "provider_query_unknown", err))
+		return current, storeErr
 	}
-	return s.applyProviderResponse(ctx, op, result)
+	return s.applyProviderResponse(ctx, op, result, ObservationSourceQuery)
 }
 
 func (s *Service) Get(ctx context.Context, operationID string, reconcile bool) (Operation, error) {
@@ -335,17 +392,33 @@ func (s *Service) Get(ctx context.Context, operationID string, reconcile bool) (
 	if op.Status == StatusCreated {
 		return Operation{}, ErrResubmitRequired
 	}
+	inFlight, err := s.store.DispatchInFlight(ctx, op.OperationID)
+	if err != nil {
+		return Operation{}, err
+	}
+	if inFlight {
+		return op, nil
+	}
 	if op.Status != StatusSending && op.Status != StatusUnknown {
 		return op, nil
 	}
 	result, err := s.queryProviderWithTimeout(ctx, op)
 	if errors.Is(err, ErrProviderOperationNotFound) {
+		current, applied, storeErr := s.applyProviderObservationDurably(ctx, &op, providerAbsenceObservation(op.OperationID))
+		if storeErr != nil {
+			return Operation{}, storeErr
+		}
+		if !applied {
+			return current, nil
+		}
 		return Operation{}, ErrResubmitRequired
 	}
 	if err != nil {
-		return s.setStatusDurably(ctx, op.OperationID, StatusUnknown, "possible", "", "provider_query_unknown")
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, &op,
+			providerCallErrorObservation(op.OperationID, ObservationSourceQuery, "provider_query_unknown", err))
+		return current, storeErr
 	}
-	return s.applyProviderResponse(ctx, op, result)
+	return s.applyProviderResponse(ctx, op, result, ObservationSourceQuery)
 }
 
 func (s *Service) queryProviderWithTimeout(ctx context.Context, op Operation) (providerResponse, error) {
@@ -357,7 +430,7 @@ func (s *Service) queryProviderWithTimeout(ctx context.Context, op Operation) (p
 	return s.queryProvider(providerCtx, op)
 }
 
-func (s *Service) applyProviderResponse(ctx context.Context, op Operation, result providerResponse) (Operation, error) {
+func (s *Service) applyProviderResponse(ctx context.Context, op Operation, result providerResponse, source string) (Operation, error) {
 	if err := validateProviderResponseIdentity(result, op.Provider, op.OperationID); err != nil {
 		s.log.Error("provider query response identity mismatch",
 			"operation_id", op.OperationID,
@@ -365,16 +438,47 @@ func (s *Service) applyProviderResponse(ctx context.Context, op Operation, resul
 			"response_operation_id", result.OperationID,
 			"response_provider", result.Provider,
 		)
-		return s.setStatusDurably(ctx, op.OperationID, StatusReview, "possible", "", "provider_response_identity_mismatch")
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, nil, providerResponseObservation(
+			op.OperationID, source, result, StatusReview, "possible", "", "provider_response_identity_mismatch",
+		))
+		return current, storeErr
 	}
 	status, certainty, failureCode := normalizeProviderResult(result.Status, result.ProviderReference, result.FailureCode)
-	return s.setStatusDurably(ctx, op.OperationID, status, certainty, result.ProviderReference, failureCode)
+	if status == StatusUnknown {
+		// A nonterminal Provider observation belongs to the exact query/dispatch
+		// generation that produced it. A late authorization must not clear a
+		// newer dispatch lease and admit another Provider POST.
+		current, _, storeErr := s.applyProviderObservationDurably(ctx, &op, providerResponseObservation(
+			op.OperationID, source, result, status, certainty, result.ProviderReference, failureCode,
+		))
+		return current, storeErr
+	}
+	current, _, storeErr := s.applyProviderObservationDurably(ctx, nil, providerResponseObservation(
+		op.OperationID, source, result, status, certainty, result.ProviderReference, failureCode,
+	))
+	return current, storeErr
 }
 
 func (s *Service) setStatusDurably(parent context.Context, operationID, status, certainty, reference, failureCode string) (Operation, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), durableStoreTimeout)
 	defer cancel()
 	return s.store.SetStatus(ctx, operationID, status, certainty, reference, failureCode)
+}
+
+func (s *Service) applyProviderObservationDurably(
+	parent context.Context,
+	expected *Operation,
+	observation ProviderOperationObservation,
+) (Operation, bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), durableStoreTimeout)
+	defer cancel()
+	return s.store.ApplyProviderObservation(ctx, observation, expected)
+}
+
+func (s *Service) claimDispatchDurably(parent context.Context, expected Operation) (Operation, bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), durableStoreTimeout)
+	defer cancel()
+	return s.store.ClaimDispatch(ctx, expected, s.cfg.ProviderTimeout+durableStoreTimeout)
 }
 
 func (s *Service) ApplyWebhook(ctx context.Context, providerConnectionID string, body []byte, signature string) (bool, error) {
@@ -403,10 +507,13 @@ func (s *Service) ApplyWebhook(ctx context.Context, providerConnectionID string,
 		FailureCode       string    `json:"failure_code"`
 		OccurredAt        time.Time `json:"occurred_at"`
 	}
-	if err := json.Unmarshal(body, &event); err != nil {
+	if err := decodeProviderJSONBytes(body, &event); err != nil {
 		return false, fmt.Errorf("%w: malformed JSON", ErrInvalidWebhook)
 	}
-	if event.EventID == "" || event.OperationID == "" || event.Provider != provider {
+	if event.EventID == "" || len(event.EventID) > 256 ||
+		event.OperationID == "" || len(event.OperationID) > 256 ||
+		event.Provider == "" || len(event.Provider) > 128 || event.Provider != provider ||
+		len(event.ProviderReference) > 512 || len(event.FailureCode) > 128 || event.OccurredAt.IsZero() {
 		return false, fmt.Errorf("%w: event identity is incomplete or inconsistent", ErrInvalidWebhook)
 	}
 	switch event.Status {
@@ -421,11 +528,13 @@ func (s *Service) ApplyWebhook(ctx context.Context, providerConnectionID string,
 		AllowedOperationIdentities: map[string]ProviderConnectionIdentity{providerConnectionID: pathIdentity},
 		EventID:                    event.EventID,
 		OperationID:                event.OperationID,
+		RawProviderStatus:          event.Status,
 		Status:                     status,
 		SideEffectCertainty:        certainty,
 		ProviderReference:          event.ProviderReference,
 		FailureCode:                failureCode,
 		OccurredAt:                 event.OccurredAt,
+		SanitizedPayload:           mustJSON(event),
 	}
 	if targetConnectionID, isRecoveryAlias := s.cfg.ProviderRecoveryAliases[providerConnectionID]; isRecoveryAlias {
 		verifiedEvent.AllowedOperationIdentities[targetConnectionID] = s.configuredConnections[targetConnectionID]
@@ -488,13 +597,16 @@ func (s *Service) sale(ctx context.Context, input OperationRequest, op Operation
 		return providerResponse{}, err
 	}
 	defer resp.Body.Close()
+	responseBody, err := readProviderResponseBody(resp)
+	if err != nil {
+		return providerResponse{}, err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return providerResponse{}, fmt.Errorf("provider returned HTTP %d", resp.StatusCode)
+		return providerResponse{}, newProviderCallDiagnosticError("http_error", resp.StatusCode, responseBody, errors.New("non-success HTTP status"))
 	}
 	var result providerResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result); err != nil {
-		return providerResponse{}, err
+	if err := decodeProviderJSONBytes(responseBody, &result); err != nil {
+		return providerResponse{}, newProviderCallDiagnosticError("malformed_response", resp.StatusCode, responseBody, err)
 	}
 	return result, nil
 }
@@ -510,16 +622,74 @@ func (s *Service) queryProvider(ctx context.Context, op Operation) (providerResp
 		return providerResponse{}, err
 	}
 	defer resp.Body.Close()
+	responseBody, err := readProviderResponseBody(resp)
+	if err != nil {
+		return providerResponse{}, err
+	}
 	if resp.StatusCode == http.StatusNotFound {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return providerResponse{}, ErrProviderOperationNotFound
+		// A structured body is conclusive only when this exact connection revision
+		// durably declares the capability. A proxy 404, malformed body, or another
+		// revision's Provider-brand promise cannot prove that money never moved.
+		var missing struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		binding, bound := s.configuredRevisions[op.ProviderConnectionID]
+		if bound && binding.ConnectionRevision == op.ProviderConnectionRevision && binding.ConclusiveAbsence &&
+			decodeProviderJSONBytes(responseBody, &missing) == nil && missing.Error.Code == "operation_not_found" {
+			return providerResponse{}, ErrProviderOperationNotFound
+		}
+		return providerResponse{}, newProviderCallDiagnosticError(
+			"unproven_not_found", resp.StatusCode, responseBody, errors.New("provider query returned an unproven HTTP 404"),
+		)
 	}
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return providerResponse{}, fmt.Errorf("provider query returned HTTP %d", resp.StatusCode)
+		return providerResponse{}, newProviderCallDiagnosticError("http_error", resp.StatusCode, responseBody, errors.New("non-success HTTP status"))
 	}
 	var result providerResponse
-	return result, json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&result)
+	if err := decodeProviderJSONBytes(responseBody, &result); err != nil {
+		return providerResponse{}, newProviderCallDiagnosticError("malformed_response", resp.StatusCode, responseBody, err)
+	}
+	return result, nil
+}
+
+const maxProviderResponseBytes = 64 << 10
+
+func readProviderResponseBody(response *http.Response) ([]byte, error) {
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxProviderResponseBytes+1))
+	if err != nil {
+		return nil, newProviderCallDiagnosticError("body_read_error", response.StatusCode, body, err)
+	}
+	if len(body) > maxProviderResponseBytes {
+		return nil, newTruncatedProviderCallDiagnosticError(
+			"oversized_response", response.StatusCode, body, errors.New("provider response exceeded the bounded diagnostic limit"),
+		)
+	}
+	return body, nil
+}
+
+func newProviderCallDiagnosticError(category string, statusCode int, body []byte, cause error) error {
+	return newProviderCallDiagnosticErrorWithTruncation(category, statusCode, body, false, cause)
+}
+
+func newTruncatedProviderCallDiagnosticError(category string, statusCode int, observedPrefix []byte, cause error) error {
+	return newProviderCallDiagnosticErrorWithTruncation(category, statusCode, observedPrefix, true, cause)
+}
+
+func newProviderCallDiagnosticErrorWithTruncation(
+	category string,
+	statusCode int,
+	body []byte,
+	truncated bool,
+	cause error,
+) error {
+	hash := sha256.Sum256(body)
+	return &providerCallDiagnosticError{
+		category: category, statusCode: statusCode,
+		bodyHash: hex.EncodeToString(hash[:]), byteCount: len(body), truncated: truncated, cause: cause,
+	}
 }
 
 func (s *Service) deliverOutcome(ctx context.Context, outcome ProviderOutcome) error {
@@ -611,7 +781,26 @@ func cloneStringMap(input map[string]string) map[string]string {
 	return cloned
 }
 
+func cloneBoolMap(input map[string]bool) map[string]bool {
+	cloned := make(map[string]bool, len(input))
+	for key, value := range input {
+		cloned[key] = value
+	}
+	return cloned
+}
+
 func normalizeProviderEndpoint(raw string) (string, error) {
+	return normalizeGatewayURL(raw, false)
+}
+
+// normalizeGatewayURL gives execution and registry code one URL identity.
+// Development may use HTTP for the local simulator; every non-development
+// funds or callback boundary is authenticated by TLS before any token or
+// internal service credential can cross it.
+func normalizeGatewayURL(raw string, requireHTTPS bool) (string, error) {
+	if strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) != raw {
+		return "", errors.New("URL must be non-empty and must not contain surrounding whitespace")
+	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return "", errors.New("endpoint must be an absolute HTTP or HTTPS URL")
@@ -620,6 +809,9 @@ func normalizeProviderEndpoint(raw string) (string, error) {
 	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.Opaque != "" ||
 		parsed.User != nil || parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" {
 		return "", errors.New("endpoint must be an absolute HTTP or HTTPS URL without credentials, query, or fragment")
+	}
+	if requireHTTPS && parsed.Scheme != "https" {
+		return "", errors.New("URL must use HTTPS outside local, development, and test environments")
 	}
 	parsed.Host = strings.ToLower(parsed.Host)
 	if port := parsed.Port(); (parsed.Scheme == "http" && port == "80") || (parsed.Scheme == "https" && port == "443") {
@@ -630,7 +822,7 @@ func normalizeProviderEndpoint(raw string) (string, error) {
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-func connectionRevisionBinding(identity ProviderConnectionIdentity, normalizedEndpoint, webhookSecret string) ProviderConnectionRevisionBinding {
+func connectionRevisionBinding(identity ProviderConnectionIdentity, normalizedEndpoint, webhookSecret string, conclusiveAbsence bool) ProviderConnectionRevisionBinding {
 	secretDigest := sha256.Sum256([]byte(webhookSecret))
 	material := struct {
 		Version             int    `json:"version"`
@@ -648,7 +840,7 @@ func connectionRevisionBinding(identity ProviderConnectionIdentity, normalizedEn
 	fingerprint := sha256.Sum256(mustJSON(material))
 	return ProviderConnectionRevisionBinding{
 		ProviderConnectionIdentity: identity, FingerprintVersion: executionFingerprintVersion,
-		ConfigFingerprint: hex.EncodeToString(fingerprint[:]),
+		ConfigFingerprint: hex.EncodeToString(fingerprint[:]), ConclusiveAbsence: conclusiveAbsence,
 	}
 }
 
@@ -663,7 +855,9 @@ func normalizeProviderStatus(status string) (string, string) {
 	case "declined", "failed":
 		return StatusFailed, "none"
 	default:
-		return StatusUnknown, "possible"
+		// An adapter protocol value outside the explicit allowlist is drift, not
+		// a recoverable transport ambiguity. Stop automatic execution for review.
+		return StatusReview, "possible"
 	}
 }
 
@@ -679,6 +873,9 @@ func normalizeProviderResult(status, providerReference, failureCode string) (str
 	}
 	if normalizedStatus == StatusSucceeded && strings.TrimSpace(providerReference) == "" {
 		return StatusReview, "possible", "provider_reference_missing"
+	}
+	if normalizedStatus == StatusReview && strings.TrimSpace(failureCode) == "" {
+		failureCode = "unsupported_provider_status"
 	}
 	return normalizedStatus, certainty, failureCode
 }

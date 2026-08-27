@@ -22,6 +22,7 @@ var (
 	ErrIdempotencyConflict       = errors.New("idempotency key reused for a different request")
 	ErrMerchantReferenceConflict = errors.New("merchant reference already exists")
 	ErrStateConflict             = errors.New("payment intent state conflict")
+	ErrClockSkew                 = errors.New("payment process clock is outside the database safety window")
 )
 
 type Store struct {
@@ -34,6 +35,32 @@ func NewStore(pool *pgxpool.Pool) *Store {
 
 func (s *Store) Ping(ctx context.Context) error {
 	return s.pool.Ping(ctx)
+}
+
+// Ready treats PostgreSQL as the deployment clock witness. Because the exact
+// one-way network delays are unknown, every possible offset implied by the
+// sample must fit inside maxClockSkew. Network uncertainty consumes the budget;
+// it never widens it.
+func (s *Store) Ready(ctx context.Context, maxClockSkew time.Duration) error {
+	if maxClockSkew <= 0 {
+		return ErrClockSkew
+	}
+	startedAt := time.Now().UTC()
+	var databaseNow time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&databaseNow); err != nil {
+		return fmt.Errorf("%w: database clock query failed: %v", ErrClockSkew, err)
+	}
+	finishedAt := time.Now().UTC()
+	if !databaseClockWithinProcessWindow(databaseNow.UTC(), startedAt, finishedAt, maxClockSkew) {
+		return ErrClockSkew
+	}
+	return nil
+}
+
+func databaseClockWithinProcessWindow(databaseNow, startedAt, finishedAt time.Time, maxClockSkew time.Duration) bool {
+	return maxClockSkew > 0 && !finishedAt.Before(startedAt) &&
+		!databaseNow.Before(finishedAt.Add(-maxClockSkew)) &&
+		!databaseNow.After(startedAt.Add(maxClockSkew))
 }
 
 type StoredResponse struct {
@@ -68,6 +95,10 @@ type CreateIntentResult struct {
 }
 
 func (s *Store) CreateIntent(ctx context.Context, command CreateIntentCommand) (CreateIntentResult, error) {
+	return retryTransaction(ctx, func() (CreateIntentResult, error) { return s.createIntentOnce(ctx, command) })
+}
+
+func (s *Store) createIntentOnce(ctx context.Context, command CreateIntentCommand) (CreateIntentResult, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return CreateIntentResult{}, fmt.Errorf("begin create intent: %w", err)
@@ -136,7 +167,7 @@ func (s *Store) CreateIntent(ctx context.Context, command CreateIntentCommand) (
 func (s *Store) LookupIdempotency(ctx context.Context, merchantID, key, operation string, requestHash []byte) (IdempotencyLookup, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT operation, request_hash, state, COALESCE(resource_id,''),
-		       COALESCE(response_status,0), COALESCE(response_body,''::bytea)
+		       COALESCE(response_status,0), COALESCE(response_body,''::bytea), fingerprint_version
 		FROM idempotency_records
 		WHERE merchant_id=$1 AND idempotency_key=$2`, merchantID, key)
 	return scanIdempotency(row, operation, requestHash)
@@ -159,6 +190,10 @@ type PrepareConfirmationResult struct {
 }
 
 func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirmationCommand) (PrepareConfirmationResult, error) {
+	return retryTransaction(ctx, func() (PrepareConfirmationResult, error) { return s.prepareConfirmationOnce(ctx, command) })
+}
+
+func (s *Store) prepareConfirmationOnce(ctx context.Context, command PrepareConfirmationCommand) (PrepareConfirmationResult, error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
 		return PrepareConfirmationResult{}, fmt.Errorf("begin confirmation: %w", err)
@@ -200,7 +235,7 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 		}
 		return PrepareConfirmationResult{}, err
 	}
-	if err := validateRoutingEvidence(attempt, intent); err != nil {
+	if err := validateRoutingEvidence(attempt, intent, command.Now); err != nil {
 		return PrepareConfirmationResult{}, err
 	}
 
@@ -209,12 +244,14 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 			id, payment_intent_id, attempt_number, routing_decision_id,
 			provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
 			status, outcome_code, reroute_disposition, provider_payment_reference,
-			version, created_at, updated_at, routing_context_snapshot, routing_decision_snapshot
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,$11,$12,$13,NULLIF($14,'')::jsonb,NULLIF($15,'')::jsonb)`,
+			version, created_at, updated_at, routing_context_snapshot, routing_decision_snapshot,
+			routing_executable_until
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NULL,$10,NULL,$11,$12,$13,NULLIF($14,'')::jsonb,NULLIF($15,'')::jsonb,$16)`,
 		attempt.ID, attempt.PaymentIntentID, attempt.AttemptNumber, attempt.RoutingDecisionID,
 		attempt.ProviderConnectionID, attempt.ProviderConnectionRevision, attempt.ProviderNamespaceID,
 		attempt.Provider, attempt.Status, attempt.RerouteDisposition, attempt.Version,
 		attempt.CreatedAt, attempt.UpdatedAt, attempt.RoutingContextSnapshot, attempt.RoutingDecisionSnapshot,
+		attempt.RoutingExecutableUntil,
 	)
 	if err != nil {
 		return PrepareConfirmationResult{}, fmt.Errorf("insert payment attempt: %w", err)
@@ -226,14 +263,17 @@ func (s *Store) PrepareConfirmation(ctx context.Context, command PrepareConfirma
 			provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
 			provider_idempotency_key, merchant_reference, request_hash,
 			status, side_effect_certainty, retry_mode, retry_count, version,
-			created_at, updated_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+			created_at, updated_at, recovery_deadline_at, recovery_budget_remaining,
+			recovery_policy_version, recovery_claim_basis, recovery_action
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
 		operation.ID, operation.PaymentIntentID, operation.PaymentAttemptID, operation.Kind,
 		operation.AmountMinor, operation.Currency, operation.ProviderConnectionID,
 		operation.ProviderConnectionRevision, operation.ProviderNamespaceID, operation.Provider,
 		operation.ProviderIdempotencyKey, operation.MerchantReference, operation.RequestHash,
 		operation.Status, operation.SideEffectCertainty, operation.RetryMode,
 		operation.RetryCount, operation.Version, operation.CreatedAt, operation.UpdatedAt,
+		operation.RecoveryDeadlineAt, operation.RecoveryBudgetRemaining,
+		operation.RecoveryPolicyVersion, operation.RecoveryClaimBasis, operation.RecoveryAction,
 	)
 	if err != nil {
 		return PrepareConfirmationResult{}, fmt.Errorf("insert provider operation: %w", err)
@@ -277,6 +317,27 @@ func (s *Store) MarkOperationSending(ctx context.Context, operationID string, no
 	aggregate, err := getAggregateByOperationTx(ctx, tx, operationID, true)
 	if err != nil {
 		return Aggregate{}, err
+	}
+	if aggregate.Operation.Status != domain.OperationCreated {
+		return Aggregate{}, domain.ErrInvalidTransition
+	}
+	if aggregate.Operation.FirstDispatchedAt == nil && validateRoutingEvidence(aggregate.Attempt, aggregate.Intent, now) != nil {
+		if err := stopRecoveryTx(ctx, tx, &aggregate, "routing_authority_expired_before_first_dispatch", now); err != nil {
+			return Aggregate{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Aggregate{}, err
+		}
+		return aggregate, domain.ErrInvalidTransition
+	}
+	if !now.Before(aggregate.Operation.RecoveryDeadlineAt) {
+		if err := stopRecoveryTx(ctx, tx, &aggregate, "recovery_deadline_exhausted", now); err != nil {
+			return Aggregate{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Aggregate{}, err
+		}
+		return aggregate, domain.ErrInvalidTransition
 	}
 	if err := domain.MarkSending(&aggregate.Intent, &aggregate.Attempt, &aggregate.Operation, now); err != nil {
 		return Aggregate{}, err
@@ -343,7 +404,7 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 			)
 			var aggregate Aggregate
 			if resolveErr == nil {
-				aggregate, loadErr = getAggregateByOperationTx(ctx, tx, storedOperationID, false)
+				aggregate, loadErr = getAggregateByOperationTx(ctx, tx, storedOperationID, true)
 				if loadErr != nil {
 					resolveErr = loadErr
 				}
@@ -351,6 +412,14 @@ func (s *Store) ApplyOutcome(ctx context.Context, outcome domain.ProviderOutcome
 			correlationConflict := resolveErr != nil || !stored.PayloadMatches || correlationMismatch(storedOperationID, aggregate, outcome)
 			if correlationConflict {
 				reason := "duplicate event_id was delivered with different correlation or payload"
+				// Only a changed payload that is positively correlated to the
+				// original exact tuple may escalate that aggregate. A foreign
+				// connection reusing an event ID must not poison its funds state.
+				if resolveErr == nil && !stored.PayloadMatches && !correlationMismatch(storedOperationID, aggregate, outcome) {
+					if _, err := requireAggregateReviewTx(ctx, tx, &aggregate, "provider_event_payload_conflict", reason, receivedAt); err != nil {
+						return ApplyOutcomeResult{}, err
+					}
+				}
 				if err := quarantineOutcomeTx(ctx, tx, outcome, sanitizedPayload, receivedAt, "conflict", reason); err != nil {
 					return ApplyOutcomeResult{}, err
 				}
@@ -707,74 +776,26 @@ func (s *Store) CompleteIdempotency(ctx context.Context, merchantID, key string,
 	commandTag, err := s.pool.Exec(ctx, `
 		UPDATE idempotency_records
 		SET state='completed',response_status=$3,response_body=$4,updated_at=$5
-		WHERE merchant_id=$1 AND idempotency_key=$2`, merchantID, key, response.Status, response.Body, now)
+		WHERE merchant_id=$1 AND idempotency_key=$2 AND state='in_progress'`, merchantID, key, response.Status, response.Body, now)
 	if err != nil {
 		return fmt.Errorf("complete idempotency record: %w", err)
 	}
 	if commandTag.RowsAffected() != 1 {
-		return ErrNotFound
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM idempotency_records WHERE merchant_id=$1 AND idempotency_key=$2)`, merchantID, key).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return ErrNotFound
+		}
+		// Another completion already committed the replay. Do not let a
+		// delayed HTTP handler overwrite that stable response with stale 202.
 	}
 	return nil
 }
 
 func (s *Store) GetIntent(ctx context.Context, merchantID, intentID string) (domain.PaymentIntent, error) {
 	return getIntentTx(ctx, s.pool, merchantID, intentID, false)
-}
-
-type RecoverableOperation struct {
-	OperationID string
-	Status      domain.OperationStatus
-	UpdatedAt   time.Time
-}
-
-func (s *Store) ClaimRecoverableOperations(ctx context.Context, now time.Time, staleAge, lease time.Duration, limit int) ([]RecoverableOperation, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin recoverable operation claim: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-
-	staleBefore := now.Add(-staleAge)
-	rows, err := tx.Query(ctx, `
-		SELECT id,status,updated_at
-		FROM provider_operations
-		WHERE status IN ('created','sending','pending','unknown','retry_scheduled')
-		  AND (
-		    (next_retry_at IS NULL AND updated_at <= $1)
-		    OR next_retry_at <= $2
-		  )
-		ORDER BY COALESCE(next_retry_at,updated_at) ASC
-		FOR UPDATE SKIP LOCKED
-		LIMIT $3`, staleBefore, now, limit)
-	if err != nil {
-		return nil, fmt.Errorf("select recoverable operations for claim: %w", err)
-	}
-	defer rows.Close()
-	var operations []RecoverableOperation
-	for rows.Next() {
-		var operation RecoverableOperation
-		if err := rows.Scan(&operation.OperationID, &operation.Status, &operation.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("scan recoverable operation: %w", err)
-		}
-		operations = append(operations, operation)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	rows.Close()
-	leaseUntil := now.Add(lease)
-	for _, operation := range operations {
-		if _, err := tx.Exec(ctx, `
-			UPDATE provider_operations SET next_retry_at=$2 WHERE id=$1`,
-			operation.OperationID, leaseUntil,
-		); err != nil {
-			return nil, fmt.Errorf("lease recoverable operation %s: %w", operation.OperationID, err)
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit recoverable operation claim: %w", err)
-	}
-	return operations, nil
 }
 
 func (s *Store) GetAggregateByOperation(ctx context.Context, operationID string) (Aggregate, error) {
@@ -784,9 +805,9 @@ func (s *Store) GetAggregateByOperation(ctx context.Context, operationID string)
 func insertIdempotency(ctx context.Context, tx pgx.Tx, merchantID, key, operation string, requestHash []byte, resourceID string, now time.Time) (bool, error) {
 	commandTag, err := tx.Exec(ctx, `
 		INSERT INTO idempotency_records (
-			merchant_id,idempotency_key,operation,request_hash,state,resource_id,created_at,updated_at
-		) VALUES ($1,$2,$3,$4,'in_progress',$5,$6,$6)
-		ON CONFLICT (merchant_id,idempotency_key) DO NOTHING`, merchantID, key, operation, requestHash, resourceID, now)
+			merchant_id,idempotency_key,operation,request_hash,state,resource_id,created_at,updated_at,fingerprint_version
+		) VALUES ($1,$2,$3,$4,'in_progress',$5,$6,$6,$7)
+		ON CONFLICT (merchant_id,idempotency_key) DO NOTHING`, merchantID, key, operation, requestHash, resourceID, now, idempotency.FingerprintVersion)
 	if err != nil {
 		return false, fmt.Errorf("insert idempotency record: %w", err)
 	}
@@ -796,7 +817,7 @@ func insertIdempotency(ctx context.Context, tx pgx.Tx, merchantID, key, operatio
 func lookupIdempotencyTx(ctx context.Context, tx pgx.Tx, merchantID, key, operation string, requestHash []byte) (IdempotencyLookup, error) {
 	row := tx.QueryRow(ctx, `
 		SELECT operation,request_hash,state,COALESCE(resource_id,''),
-		       COALESCE(response_status,0),COALESCE(response_body,''::bytea)
+		       COALESCE(response_status,0),COALESCE(response_body,''::bytea),fingerprint_version
 		FROM idempotency_records
 		WHERE merchant_id=$1 AND idempotency_key=$2
 		FOR UPDATE`, merchantID, key)
@@ -808,15 +829,15 @@ type rowScanner interface {
 }
 
 func scanIdempotency(row rowScanner, operation string, requestHash []byte) (IdempotencyLookup, error) {
-	var storedOperation, state, resourceID string
+	var storedOperation, state, resourceID, fingerprintVersion string
 	var storedHash, body []byte
 	var status int
-	if err := row.Scan(&storedOperation, &storedHash, &state, &resourceID, &status, &body); errors.Is(err, pgx.ErrNoRows) {
+	if err := row.Scan(&storedOperation, &storedHash, &state, &resourceID, &status, &body, &fingerprintVersion); errors.Is(err, pgx.ErrNoRows) {
 		return IdempotencyLookup{}, nil
 	} else if err != nil {
 		return IdempotencyLookup{}, fmt.Errorf("read idempotency record: %w", err)
 	}
-	if storedOperation != operation || !idempotency.Equal(storedHash, requestHash) {
+	if fingerprintVersion != idempotency.FingerprintVersion || storedOperation != operation || !idempotency.Equal(storedHash, requestHash) {
 		return IdempotencyLookup{}, ErrIdempotencyConflict
 	}
 	return IdempotencyLookup{
@@ -913,7 +934,9 @@ func getAggregateByOperationTx(ctx context.Context, query queryer, operationID s
 		       provider_idempotency_key,merchant_reference,request_hash,status,
 		       side_effect_certainty,retry_mode,COALESCE(provider_operation_reference,''),
 		       COALESCE(normalized_code,''),COALESCE(provider_code,''),retry_count,
-		       next_retry_at,COALESCE(last_error,''),version,created_at,updated_at,completed_at
+		       next_retry_at,COALESCE(last_error,''),version,created_at,updated_at,completed_at,
+		       first_dispatched_at,recovery_deadline_at,recovery_budget_remaining,recovery_policy_version,
+		       recovery_lease_until,recovery_claim_generation,recovery_claim_basis,recovery_action,COALESCE(recovery_stop_reason,''),recovery_evidence
 		FROM provider_operations WHERE id=$1`+suffix, operationID)
 	operation, err := scanOperation(operationRow)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -927,7 +950,8 @@ func getAggregateByOperationTx(ctx context.Context, query queryer, operationID s
 		       provider_connection_id,provider_connection_revision,provider_namespace_id,provider,status,
 		       COALESCE(outcome_code,''),reroute_disposition,
 		       COALESCE(provider_payment_reference,''),version,created_at,updated_at,
-		       COALESCE(routing_context_snapshot::text,''),COALESCE(routing_decision_snapshot::text,'')
+		       COALESCE(routing_context_snapshot::text,''),COALESCE(routing_decision_snapshot::text,''),
+		       routing_executable_until
 		FROM payment_attempts WHERE id=$1`+suffix, operation.PaymentAttemptID)
 	attempt, err := scanAttempt(attemptRow)
 	if err != nil {
@@ -960,12 +984,14 @@ func scanAttempt(row rowScanner) (domain.PaymentAttempt, error) {
 		&attempt.ProviderNamespaceID, &attempt.Provider, &attempt.Status,
 		&attempt.OutcomeCode, &attempt.RerouteDisposition, &attempt.ProviderPaymentReference,
 		&attempt.Version, &attempt.CreatedAt, &attempt.UpdatedAt, &attempt.RoutingContextSnapshot, &attempt.RoutingDecisionSnapshot,
+		&attempt.RoutingExecutableUntil,
 	)
 	return attempt, err
 }
 
 func scanOperation(row rowScanner) (domain.ProviderOperation, error) {
 	var operation domain.ProviderOperation
+	var evidence []byte
 	err := row.Scan(
 		&operation.ID, &operation.PaymentIntentID, &operation.PaymentAttemptID,
 		&operation.Kind, &operation.AmountMinor, &operation.Currency, &operation.ProviderConnectionID,
@@ -976,11 +1002,22 @@ func scanOperation(row rowScanner) (domain.ProviderOperation, error) {
 		&operation.NormalizedCode, &operation.ProviderCode, &operation.RetryCount,
 		&operation.NextRetryAt, &operation.LastError, &operation.Version,
 		&operation.CreatedAt, &operation.UpdatedAt, &operation.CompletedAt,
+		&operation.FirstDispatchedAt, &operation.RecoveryDeadlineAt, &operation.RecoveryBudgetRemaining,
+		&operation.RecoveryPolicyVersion, &operation.RecoveryLeaseUntil, &operation.RecoveryClaimGeneration,
+		&operation.RecoveryClaimBasis,
+		&operation.RecoveryAction, &operation.RecoveryStopReason, &evidence,
 	)
+	if err == nil && len(evidence) > 0 {
+		err = json.Unmarshal(evidence, &operation.RecoveryEvidence)
+	}
 	return operation, err
 }
 
 func updateAggregateTx(ctx context.Context, tx pgx.Tx, aggregate Aggregate) error {
+	evidence, err := marshalRecoveryEvidence(aggregate.Operation.RecoveryEvidence)
+	if err != nil {
+		return err
+	}
 	if err := updateIntentTx(ctx, tx, aggregate.Intent); err != nil {
 		return err
 	}
@@ -1000,13 +1037,20 @@ func updateAggregateTx(ctx context.Context, tx pgx.Tx, aggregate Aggregate) erro
 		SET status=$2,side_effect_certainty=$3,retry_mode=$4,
 		    provider_operation_reference=NULLIF($5,''),normalized_code=NULLIF($6,''),
 		    provider_code=NULLIF($7,''),retry_count=$8,next_retry_at=$9,
-		    last_error=NULLIF($10,''),version=$11,updated_at=$12,completed_at=$13
+		    last_error=NULLIF($10,''),version=$11,updated_at=$12,completed_at=$13,
+		    first_dispatched_at=$14,recovery_budget_remaining=$15,recovery_lease_until=$16,
+		    recovery_claim_generation=$17,recovery_claim_basis=$18,recovery_action=$19,
+		    recovery_stop_reason=NULLIF($20,''),recovery_evidence=$21
 		WHERE id=$1`, aggregate.Operation.ID, aggregate.Operation.Status,
 		aggregate.Operation.SideEffectCertainty, aggregate.Operation.RetryMode,
 		aggregate.Operation.ProviderOperationReference, aggregate.Operation.NormalizedCode,
 		aggregate.Operation.ProviderCode, aggregate.Operation.RetryCount,
 		aggregate.Operation.NextRetryAt, aggregate.Operation.LastError,
 		aggregate.Operation.Version, aggregate.Operation.UpdatedAt, aggregate.Operation.CompletedAt,
+		aggregate.Operation.FirstDispatchedAt, aggregate.Operation.RecoveryBudgetRemaining,
+		aggregate.Operation.RecoveryLeaseUntil, aggregate.Operation.RecoveryClaimGeneration,
+		aggregate.Operation.RecoveryClaimBasis, aggregate.Operation.RecoveryAction,
+		aggregate.Operation.RecoveryStopReason, evidence,
 	); err != nil {
 		return fmt.Errorf("update provider operation: %w", err)
 	}

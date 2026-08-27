@@ -48,6 +48,16 @@ func TestApplyOutcomeCompletesConfirmationIdempotencyAtomically(t *testing.T) {
 	if state != "completed" || responseStatus != 200 {
 		t.Fatalf("idempotency completion was not committed with funds state: state=%s status=%d", state, responseStatus)
 	}
+	for _, query := range []string{
+		`UPDATE idempotency_records SET state='in_progress' WHERE merchant_id=$1 AND idempotency_key=$2`,
+		`UPDATE idempotency_records SET response_body=response_body || 'changed'::bytea WHERE merchant_id=$1 AND idempotency_key=$2`,
+	} {
+		_, updateErr := pool.Exec(ctx, query, merchantID, idempotencyKey)
+		var constraint *pgconn.PgError
+		if !errors.As(updateErr, &constraint) || constraint.Code != "23514" {
+			t.Fatalf("completed idempotency response rewrite was accepted for %q: %v", query, updateErr)
+		}
+	}
 }
 
 func TestDuplicateInboxNamespaceCorrelationCannotCompleteIncomingPayment(t *testing.T) {
@@ -140,6 +150,11 @@ func TestDuplicateInboxEventRejectsChangedPayloadWithSameCorrelation(t *testing.
 	}
 	if quarantined != 1 {
 		t.Fatalf("mutated duplicate quarantine rows=%d, want 1", quarantined)
+	}
+	reviewed, err := store.GetAggregateByOperation(ctx, aggregate.Operation.ID)
+	if err != nil || reviewed.Intent.IntegrityStatus != domain.IntegrityReviewRequired ||
+		reviewed.Operation.Status != domain.OperationReviewRequired || reviewed.Intent.Status != domain.IntentProcessing {
+		t.Fatalf("correlated payload conflict did not preserve UNKNOWN for review: %+v err=%v", reviewed, err)
 	}
 }
 
@@ -421,8 +436,8 @@ func TestDatabaseRejectsOperationExecutionIdentityDrift(t *testing.T) {
 		UPDATE provider_operations SET provider_connection_revision='rebound_v2' WHERE id=$1`, aggregate.Operation.ID,
 	)
 	var constraintError *pgconn.PgError
-	if !errors.As(err, &constraintError) || constraintError.Code != "23503" {
-		t.Fatalf("identity drift error=%v, want foreign-key violation", err)
+	if !errors.As(err, &constraintError) || constraintError.Code != "23514" {
+		t.Fatalf("identity drift error=%v, want immutable-identity violation", err)
 	}
 	stored, err := store.GetAggregateByOperation(ctx, aggregate.Operation.ID)
 	if err != nil || stored.Operation.ProviderConnectionRevision != aggregate.Operation.ProviderConnectionRevision {

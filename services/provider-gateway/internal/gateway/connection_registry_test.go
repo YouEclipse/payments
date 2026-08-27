@@ -19,6 +19,7 @@ func TestConnectionRegistryRejectsMutationOfBoundRevision(t *testing.T) {
 		{"webhook_secret", func(cfg Config) { cfg.WebhookSecrets[registryTestConnectionID] = "rotated-registry-test-secret" }},
 		{"provider", func(cfg Config) { cfg.ProviderKinds[registryTestConnectionID] = "provider_registry_other" }},
 		{"namespace", func(cfg Config) { cfg.ProviderNamespaceIDs[registryTestConnectionID] = "registry_other_account" }},
+		{"conclusive_absence", func(cfg Config) { cfg.ProviderConclusiveAbsence[registryTestConnectionID] = true }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := NewMemoryStore()
@@ -79,6 +80,31 @@ func TestConnectionRegistryNormalizedEndpointsHaveOneBinding(t *testing.T) {
 				if got, exists := registryMemoryBinding(store, registryTestConnectionID, identity.ConnectionRevision); !exists || got != want {
 					t.Fatalf("normalized endpoint changed binding: exists=%v got=%+v want=%+v", exists, got, want)
 				}
+			}
+		})
+	}
+}
+
+func TestProductionGatewayRejectsPlaintextExecutionBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{"provider_endpoint", func(cfg *Config) { cfg.ProviderEndpoints[registryTestConnectionID] = "http://provider.registry.test" }},
+		{"webhook_base", func(cfg *Config) { cfg.WebhookBaseURL = "http://gateway.registry.test" }},
+		{"payment_outcome", func(cfg *Config) { cfg.PaymentOutcomeURL = "http://payment.registry.test/provider-outcomes" }},
+		{"provider_credentials", func(cfg *Config) {
+			cfg.ProviderEndpoints[registryTestConnectionID] = "https://user:secret@provider.registry.test"
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := registryTestConfig("https://provider.registry.test", "registry-test-secret")
+			cfg.Environment = "production"
+			cfg.InternalToken = "production-internal-token"
+			cfg.PaymentOutcomeURL = "https://payment.registry.test/provider-outcomes"
+			test.mutate(&cfg)
+			if _, err := NewService(cfg, NewMemoryStore(), nil); err == nil {
+				t.Fatal("unsafe production URL was accepted")
 			}
 		})
 	}
@@ -178,6 +204,7 @@ func registryTestConfig(endpoint, secret string) Config {
 		ProviderKinds:               map[string]string{registryTestConnectionID: identity.Provider},
 		ProviderConnectionRevisions: map[string]string{registryTestConnectionID: identity.ConnectionRevision},
 		ProviderNamespaceIDs:        map[string]string{registryTestConnectionID: identity.NamespaceID},
+		ProviderConclusiveAbsence:   map[string]bool{registryTestConnectionID: false},
 		ProviderEndpoints:           map[string]string{registryTestConnectionID: endpoint},
 		WebhookSecrets:              map[string]string{registryTestConnectionID: secret},
 		WebhookBaseURL:              "https://gateway.registry.test",
@@ -190,7 +217,7 @@ func registryBindingForTest(t *testing.T, identity ProviderConnectionIdentity, e
 	if err != nil {
 		t.Fatalf("normalize test endpoint: %v", err)
 	}
-	return connectionRevisionBinding(identity, normalized, secret)
+	return connectionRevisionBinding(identity, normalized, secret, false)
 }
 
 func registryMemoryBinding(store *MemoryStore, connectionID, revision string) (ProviderConnectionRevisionBinding, bool) {
@@ -262,7 +289,7 @@ func registrySeedUnknownOperation(t *testing.T, ctx context.Context, store Store
 		ProviderNamespaceID: identity.NamespaceID, Provider: identity.Provider,
 		ProviderIdempotencyKey: input.OperationID, RequestHash: operationHashV2(input),
 		RequestHashVersion: requestHashVersionConnection, LegacyRequestHash: operationHashV1(input),
-		Status: StatusUnknown, SideEffectCertainty: "possible", CreatedAt: now, UpdatedAt: now,
+		Status: StatusUnknown, SideEffectCertainty: "possible", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil || !inserted {
 		t.Fatalf("seed registry UNKNOWN operation: inserted=%v err=%v", inserted, err)

@@ -13,9 +13,13 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/YouEclipse/payments/internal/riskdecision"
 )
 
 const SchemaVersion = "routing_context.v1"
+const RiskSchemaVersion = "routing_context.v2"
+const OnlineMaxAge = 5 * time.Minute
 
 var ErrInvalidContext = errors.New("invalid routing context")
 
@@ -52,11 +56,12 @@ type PaymentMethod struct {
 }
 
 type Context struct {
-	SchemaVersion string        `json:"context_schema_version"`
-	BuiltAt       time.Time     `json:"built_at"`
-	Base          Base          `json:"base"`
-	Merchant      Merchant      `json:"merchant"`
-	PaymentMethod PaymentMethod `json:"payment_method_context"`
+	SchemaVersion string                 `json:"context_schema_version"`
+	BuiltAt       time.Time              `json:"built_at"`
+	Base          Base                   `json:"base"`
+	Merchant      Merchant               `json:"merchant"`
+	PaymentMethod PaymentMethod          `json:"payment_method_context"`
+	Risk          *riskdecision.Decision `json:"risk,omitempty"`
 }
 
 type MerchantProfile struct {
@@ -91,6 +96,7 @@ type Input struct {
 type Builder struct {
 	profiles map[string]MerchantProfile
 	metadata MetadataSource
+	risk     RiskSource
 }
 
 func NewBuilder(profiles []MerchantProfile, metadata MetadataSource) (*Builder, error) {
@@ -139,6 +145,22 @@ func (b *Builder) Build(ctx context.Context, input Input, now time.Time) (Contex
 	if err := result.Validate(); err != nil {
 		return Context{}, err
 	}
+	if b.risk != nil {
+		subject, err := result.RiskSubjectDigest()
+		if err != nil {
+			return Context{}, err
+		}
+		decision, err := b.risk.Evaluate(ctx, RiskInput{SubjectDigest: subject, MerchantID: input.MerchantID,
+			AmountMinor: input.AmountMinor, Currency: input.Currency}, now)
+		if err != nil {
+			return Context{}, fmt.Errorf("%w: risk decision unavailable", ErrInvalidContext)
+		}
+		owned := riskdecision.Clone(decision)
+		result.SchemaVersion, result.Risk = RiskSchemaVersion, &owned
+		if err := result.Validate(); err != nil {
+			return Context{}, err
+		}
+	}
 	return result, nil
 }
 
@@ -152,7 +174,7 @@ var (
 // account support remain the versioned capability catalog's responsibility;
 // these syntax checks do not claim to implement all ISO reference data.
 func (c Context) Validate() error {
-	if c.SchemaVersion != SchemaVersion || c.BuiltAt.IsZero() ||
+	if (c.SchemaVersion != SchemaVersion && c.SchemaVersion != RiskSchemaVersion) || c.BuiltAt.IsZero() ||
 		!identifier.MatchString(c.Base.PaymentID) || !identifier.MatchString(c.Base.AttemptID) ||
 		!identifier.MatchString(c.Base.MerchantID) || !identifier.MatchString(c.Merchant.EntityID) ||
 		c.Base.AmountMinor <= 0 || !currency.MatchString(c.Base.Currency) ||
@@ -182,7 +204,59 @@ func (c Context) Validate() error {
 	if value := c.PaymentMethod.Network.Value; value != nil && !oneOf(*value, "visa", "mastercard", "amex", "discover", "jcb", "unionpay", "diners") {
 		return fmt.Errorf("%w: unsupported network metadata", ErrInvalidContext)
 	}
+	if c.SchemaVersion == SchemaVersion && c.Risk != nil {
+		return fmt.Errorf("%w: risk is not part of schema v1", ErrInvalidContext)
+	}
+	if c.SchemaVersion == RiskSchemaVersion {
+		subject, err := c.RiskSubjectDigest()
+		if err != nil || c.Risk == nil || c.Risk.Validate(c.BuiltAt, subject) != nil {
+			return fmt.Errorf("%w: invalid risk evidence", ErrInvalidContext)
+		}
+	}
 	return nil
+}
+
+// ValidateOnline is the last admission check before Payment persists a funds
+// operation. Replay remains evaluated at BuiltAt, but an old Context or an
+// expired known/risk fact cannot gain fresh execution authority from storage.
+func (c Context) ValidateOnline(now time.Time, maxAge time.Duration) error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	if maxAge <= 0 || now.IsZero() || c.BuiltAt.After(now) || !now.Before(c.BuiltAt.Add(maxAge)) {
+		return fmt.Errorf("%w: routing context is outside the online freshness window", ErrInvalidContext)
+	}
+	for _, field := range []Observed{c.Merchant.Country, c.PaymentMethod.Network, c.PaymentMethod.IssuerCountry, c.PaymentMethod.CredentialDomain} {
+		if field.State == "known" && !now.Before(*field.ExpiresAt) {
+			return fmt.Errorf("%w: known routing fact expired before admission", ErrInvalidContext)
+		}
+	}
+	if c.Risk != nil {
+		subject, err := c.RiskSubjectDigest()
+		if err != nil || c.Risk.Validate(now, subject) != nil {
+			return fmt.Errorf("%w: risk decision expired before admission", ErrInvalidContext)
+		}
+	}
+	return nil
+}
+
+// OnlineAuthorityUntil is the exclusive upper bound of Context-owned online
+// authority. Router may bind an earlier artifact deadline, but never a later
+// one, into the execution decision.
+func (c Context) OnlineAuthorityUntil(maxAge time.Duration) (time.Time, error) {
+	if err := c.Validate(); err != nil || maxAge <= 0 {
+		return time.Time{}, ErrInvalidContext
+	}
+	until := c.BuiltAt.Add(maxAge)
+	for _, field := range []Observed{c.Merchant.Country, c.PaymentMethod.Network, c.PaymentMethod.IssuerCountry, c.PaymentMethod.CredentialDomain} {
+		if field.State == "known" && field.ExpiresAt != nil && field.ExpiresAt.Before(until) {
+			until = *field.ExpiresAt
+		}
+	}
+	if c.Risk != nil && c.Risk.ExpiresAt.Before(until) {
+		until = c.Risk.ExpiresAt
+	}
+	return until.UTC(), nil
 }
 
 func validateObserved(field Observed, builtAt time.Time) error {

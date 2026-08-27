@@ -88,12 +88,28 @@ func TestPaymentVerticalSlice(t *testing.T) {
 		if current := getIntent(t, baseURL, apiKey, intent.ID); current.Status != "requires_confirmation" {
 			t.Fatalf("rejected routing changed payment: %+v", current)
 		}
-		pool, ctx := e2eDatabase(t)
-		var attempts, operations int
-		if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM payment_attempts WHERE payment_intent_id=$1), (SELECT count(*) FROM provider_operations WHERE payment_intent_id=$1)`, intent.ID).Scan(&attempts, &operations); err != nil || attempts != 0 || operations != 0 {
-			t.Fatalf("no-eligible created funds path: attempts=%d operations=%d err=%v", attempts, operations, err)
-		}
+		assertNoFundsPath(t, intent.ID)
 	})
+
+	for _, riskCase := range []struct {
+		name   string
+		amount int64
+	}{{"risk block", 49001}, {"authentication unsupported", 49002}, {"manual review", 49003}} {
+		t.Run(riskCase.name+" creates no funds path", func(t *testing.T) {
+			suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+			intent, response := createIntentAmount(t, baseURL, apiKey, "create-risk-"+suffix, "order-risk-"+suffix, riskCase.amount, "USD", "pm_sim_approved")
+			response.Body.Close()
+			_, confirmResponse := confirmIntent(t, baseURL, apiKey, intent.ID, "confirm-risk-"+suffix)
+			confirmResponse.Body.Close()
+			if confirmResponse.StatusCode != http.StatusUnprocessableEntity {
+				t.Fatalf("risk guardrail returned HTTP %d", confirmResponse.StatusCode)
+			}
+			if current := getIntent(t, baseURL, apiKey, intent.ID); current.Status != "requires_confirmation" {
+				t.Fatalf("risk rejection changed payment: %+v", current)
+			}
+			assertNoFundsPath(t, intent.ID)
+		})
+	}
 
 	t.Run("decline is conclusive and does not fallback", func(t *testing.T) {
 		suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -181,11 +197,27 @@ func assertSingleFundsPath(t *testing.T, paymentIntentID, wantConnection string)
 	}
 }
 
+func assertNoFundsPath(t *testing.T, paymentIntentID string) {
+	t.Helper()
+	pool, ctx := e2eDatabase(t)
+	var attempts, paymentOperations, gatewayOperations int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM payment_attempts WHERE payment_intent_id=$1),
+			(SELECT count(*) FROM provider_operations WHERE payment_intent_id=$1),
+			(SELECT count(*) FROM provider_gateway.operations WHERE operation_id IN
+				(SELECT id FROM provider_operations WHERE payment_intent_id=$1))`, paymentIntentID,
+	).Scan(&attempts, &paymentOperations, &gatewayOperations); err != nil || attempts != 0 || paymentOperations != 0 || gatewayOperations != 0 {
+		t.Fatalf("rejected decision created funds path: attempts=%d payment_operations=%d gateway_operations=%d err=%v", attempts, paymentOperations, gatewayOperations, err)
+	}
+}
+
 func assertRoutingEvidence(t *testing.T, paymentIntentID, wantCurrency, wantConnection string) {
 	t.Helper()
 	pool, ctx := e2eDatabase(t)
 	var attemptID, decisionID, contextJSON, decisionJSON string
-	if err := pool.QueryRow(ctx, `SELECT id,routing_decision_id,routing_context_snapshot::text,routing_decision_snapshot::text FROM payment_attempts WHERE payment_intent_id=$1`, paymentIntentID).Scan(&attemptID, &decisionID, &contextJSON, &decisionJSON); err != nil {
+	var relationalDeadline time.Time
+	if err := pool.QueryRow(ctx, `SELECT id,routing_decision_id,routing_context_snapshot::text,routing_decision_snapshot::text,routing_executable_until FROM payment_attempts WHERE payment_intent_id=$1`, paymentIntentID).Scan(&attemptID, &decisionID, &contextJSON, &decisionJSON, &relationalDeadline); err != nil {
 		t.Fatalf("v2 decision was not frozen with the Attempt: %v", err)
 	}
 	var snapshot struct {
@@ -198,21 +230,35 @@ func assertRoutingEvidence(t *testing.T, paymentIntentID, wantCurrency, wantConn
 			AmountMinor int64  `json:"amount_minor"`
 			Operation   string `json:"operation"`
 		} `json:"base"`
+		Risk struct {
+			Action string `json:"action"`
+		} `json:"risk"`
 	}
 	var decision struct {
-		ID             string `json:"decision_id"`
-		Schema         string `json:"context_schema_version"`
-		Digest         string `json:"context_digest"`
-		PolicyVersion  string `json:"policy_version"`
-		RuleSetVersion string `json:"rule_set_version"`
-		RuleSetDigest  string `json:"rule_set_digest"`
-		CatalogDigest  string `json:"capability_catalog_digest"`
-		Selected       struct {
+		ID              string    `json:"decision_id"`
+		Schema          string    `json:"context_schema_version"`
+		Digest          string    `json:"context_digest"`
+		ExecutableUntil time.Time `json:"executable_until"`
+		PolicyVersion   string    `json:"policy_version"`
+		RuleSetVersion  string    `json:"rule_set_version"`
+		RuleSetDigest   string    `json:"rule_set_digest"`
+		CatalogDigest   string    `json:"capability_catalog_digest"`
+		Selected        struct {
 			ID string `json:"candidate_id"`
 		} `json:"selected_candidate"`
 		Eligibility []struct {
 			ID string `json:"candidate_id"`
 		} `json:"eligibility"`
+		Risk struct {
+			Action   string `json:"action"`
+			Outcome  string `json:"outcome"`
+			Continue bool   `json:"continue"`
+		} `json:"risk"`
+		Optimization struct {
+			Scoring struct {
+				Status string `json:"status"`
+			} `json:"scoring"`
+		} `json:"optimization"`
 	}
 	if err := json.Unmarshal([]byte(contextJSON), &snapshot); err != nil {
 		t.Fatal(err)
@@ -220,10 +266,10 @@ func assertRoutingEvidence(t *testing.T, paymentIntentID, wantCurrency, wantConn
 	if err := json.Unmarshal([]byte(decisionJSON), &decision); err != nil {
 		t.Fatal(err)
 	}
-	if snapshot.Schema != "routing_context.v1" || snapshot.Base.PaymentID != paymentIntentID || snapshot.Base.AttemptID != attemptID || snapshot.Base.MerchantID != "merchant_demo" || snapshot.Base.Currency != wantCurrency || snapshot.Base.AmountMinor != 5200 || snapshot.Base.Operation != "sale" {
+	if snapshot.Schema != "routing_context.v2" || snapshot.Base.PaymentID != paymentIntentID || snapshot.Base.AttemptID != attemptID || snapshot.Base.MerchantID != "merchant_demo" || snapshot.Base.Currency != wantCurrency || snapshot.Base.AmountMinor != 5200 || snapshot.Base.Operation != "sale" || snapshot.Risk.Action != "allow" {
 		t.Fatalf("stored Context does not bind the paid Intent/Attempt: %+v", snapshot)
 	}
-	if decision.ID != decisionID || decision.Schema != snapshot.Schema || len(decision.Digest) != 71 || decision.PolicyVersion == "" || decision.PolicyVersion != decision.RuleSetVersion || len(decision.RuleSetDigest) != 71 || len(decision.CatalogDigest) != 71 || decision.Selected.ID != wantConnection || len(decision.Eligibility) != 2 {
+	if decision.ID != decisionID || decision.Schema != snapshot.Schema || len(decision.Digest) != 71 || decision.ExecutableUntil.IsZero() || !decision.ExecutableUntil.Equal(relationalDeadline) || decision.PolicyVersion == "" || decision.PolicyVersion != decision.RuleSetVersion || len(decision.RuleSetDigest) != 71 || len(decision.CatalogDigest) != 71 || decision.Selected.ID != wantConnection || len(decision.Eligibility) != 2 || decision.Risk.Action != "allow" || decision.Risk.Outcome != "allowed" || !decision.Risk.Continue || (decision.Optimization.Scoring.Status != "scored" && decision.Optimization.Scoring.Status != "static_fallback") {
 		t.Fatalf("incomplete or mismatched routing evidence: %+v", decision)
 	}
 	for _, forbidden := range []string{"payment_method_token", "pm_sim_approved", "pm_sim_timeout", `"pan"`, `"cvv"`, `"secret"`} {
@@ -235,9 +281,14 @@ func assertRoutingEvidence(t *testing.T, paymentIntentID, wantCurrency, wantConn
 
 func createIntent(t *testing.T, baseURL, apiKey, idempotencyKey, merchantReference, currency, token string) (paymentIntent, *http.Response) {
 	t.Helper()
+	return createIntentAmount(t, baseURL, apiKey, idempotencyKey, merchantReference, 5200, currency, token)
+}
+
+func createIntentAmount(t *testing.T, baseURL, apiKey, idempotencyKey, merchantReference string, amount int64, currency, token string) (paymentIntent, *http.Response) {
+	t.Helper()
 	body := map[string]any{
 		"merchant_reference":   merchantReference,
-		"amount_minor":         5200,
+		"amount_minor":         amount,
 		"currency":             currency,
 		"payment_method_token": token,
 		"capture_method":       "automatic",

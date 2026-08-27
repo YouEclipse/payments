@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func TestPostgresConnectionRegistryRejectsMutationOfBoundRevision(t *testing.T) {
@@ -26,6 +28,8 @@ func TestPostgresConnectionRegistryRejectsMutationOfBoundRevision(t *testing.T) 
 	providerDrift.Provider = "provider_registry_other"
 	namespaceDrift := identity
 	namespaceDrift.NamespaceID = "registry_other_account"
+	capabilityDrift := original
+	capabilityDrift.ConclusiveAbsence = !original.ConclusiveAbsence
 	for _, test := range []struct {
 		name    string
 		binding ProviderConnectionRevisionBinding
@@ -34,6 +38,7 @@ func TestPostgresConnectionRegistryRejectsMutationOfBoundRevision(t *testing.T) 
 		{"webhook_secret", registryBindingForTest(t, identity, "https://provider.registry.test", "registry-next-test-secret")},
 		{"provider", registryBindingForTest(t, providerDrift, "https://provider.registry.test", "registry-test-secret")},
 		{"namespace", registryBindingForTest(t, namespaceDrift, "https://provider.registry.test", "registry-test-secret")},
+		{"conclusive_absence", capabilityDrift},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if err := store.BindConnectionRevisions(ctx, map[string]ProviderConnectionRevisionBinding{connectionID: test.binding}); !errors.Is(err, ErrConnectionRevisionConflict) {
@@ -55,6 +60,39 @@ func TestPostgresConnectionRegistryRejectsMutationOfBoundRevision(t *testing.T) 
 	}
 	if got := registryPostgresBinding(t, ctx, store, connectionID, newIdentity.ConnectionRevision); got != newBinding {
 		t.Fatalf("new revision binding: got=%+v want=%+v", got, newBinding)
+	}
+}
+
+func TestPostgresConnectionRegistryAdoptsCapabilityOnce(t *testing.T) {
+	store, ctx, connectionID := registryPostgresStore(t)
+	identity := registryTestIdentity("registry_capability_v1")
+	binding := registryBindingForTest(t, identity, "https://provider.registry.test", "registry-test-secret")
+	binding.ConclusiveAbsence = true
+	if _, err := store.pool.Exec(ctx, `
+		INSERT INTO provider_gateway.provider_connection_revisions
+		(provider_connection_id,provider_connection_revision,provider_namespace_id,provider,fingerprint_version,config_fingerprint)
+		VALUES($1,$2,$3,$4,$5,$6)`, connectionID, binding.ConnectionRevision, binding.NamespaceID,
+		binding.Provider, binding.FingerprintVersion, binding.ConfigFingerprint); err != nil {
+		t.Fatalf("seed pre-capability revision: %v", err)
+	}
+	if err := store.BindConnectionRevisions(ctx, map[string]ProviderConnectionRevisionBinding{connectionID: binding}); err != nil {
+		t.Fatalf("adopt explicit capability: %v", err)
+	}
+	if got := registryPostgresBinding(t, ctx, store, connectionID, identity.ConnectionRevision); got != binding {
+		t.Fatalf("adopted binding=%+v want=%+v", got, binding)
+	}
+	_, err := store.pool.Exec(ctx, `
+		UPDATE provider_gateway.provider_connection_revisions
+		SET conclusive_absence=false
+		WHERE provider_connection_id=$1 AND provider_connection_revision=$2`, connectionID, binding.ConnectionRevision)
+	var constraint *pgconn.PgError
+	if !errors.As(err, &constraint) || constraint.Code != "23514" {
+		t.Fatalf("capability rewrite error=%v, want 23514", err)
+	}
+	drifted := binding
+	drifted.ConclusiveAbsence = false
+	if err := store.BindConnectionRevisions(ctx, map[string]ProviderConnectionRevisionBinding{connectionID: drifted}); !errors.Is(err, ErrConnectionRevisionConflict) {
+		t.Fatalf("application capability rewrite error=%v, want ErrConnectionRevisionConflict", err)
 	}
 }
 
@@ -161,10 +199,11 @@ func registryPostgresBinding(t *testing.T, ctx context.Context, store *PostgresS
 	t.Helper()
 	var binding ProviderConnectionRevisionBinding
 	if err := store.pool.QueryRow(ctx, `
-		SELECT provider,provider_connection_revision,provider_namespace_id,fingerprint_version,config_fingerprint
+		SELECT provider,provider_connection_revision,provider_namespace_id,fingerprint_version,config_fingerprint,conclusive_absence
 		FROM provider_gateway.provider_connection_revisions
 		WHERE provider_connection_id=$1 AND provider_connection_revision=$2`, connectionID, revision).Scan(
 		&binding.Provider, &binding.ConnectionRevision, &binding.NamespaceID, &binding.FingerprintVersion, &binding.ConfigFingerprint,
+		&binding.ConclusiveAbsence,
 	); err != nil {
 		t.Fatalf("read persisted registry binding: %v", err)
 	}

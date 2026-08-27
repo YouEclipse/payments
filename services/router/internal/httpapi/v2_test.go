@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -59,7 +61,7 @@ func TestV2HTTPDecisionAndRejectionCarryCanonicalEvidence(t *testing.T) {
 			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
 				t.Fatal(err)
 			}
-			if result.PolicyVersion != result.RuleSetVersion || result.ContextSchemaVersion != routingcontext.SchemaVersion || len(result.ContextDigest) != 71 || len(result.RuleSetDigest) != 71 || len(result.CapabilityCatalogDigest) != 71 || len(result.Eligibility) != 2 {
+			if result.PolicyVersion != result.RuleSetVersion || result.ContextSchemaVersion != routingcontext.SchemaVersion || len(result.ContextDigest) != 71 || result.ExecutableUntil.IsZero() || !testfixture.Now.Before(result.ExecutableUntil) || len(result.RuleSetDigest) != 71 || len(result.CapabilityCatalogDigest) != 71 || len(result.Eligibility) != 2 {
 				t.Fatal("incomplete v2 response", response.Body.String())
 			}
 			if currency == "GBP" {
@@ -180,6 +182,91 @@ func TestV2MethodAndMediaTypeAreExplicit(t *testing.T) {
 	}
 }
 
+func TestV3RejectsAuthorizeAsAnExplicitUnsupportedContract(t *testing.T) {
+	config := decision.Config{RuleSet: testfixture.RuleSet(), CapabilityCatalog: testfixture.Catalog()}
+	optimization := testfixture.Optimization()
+	config.Optimization = &optimization
+	engine, err := decision.NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(nil, nil).WithV3(engine)
+	handler.now = func() time.Time { return testfixture.Now }
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	context := testfixture.RiskContext("allow")
+	context.Base.Operation, context.Base.CaptureMethod = "authorize", "manual"
+	payload, err := json.Marshal(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/internal/v3/routing-decisions", bytes.NewReader(payload))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest || !strings.Contains(response.Body.String(), `"field":"base.operation"`) {
+		t.Fatalf("unsupported v3 operation became an internal error: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestV3HTTPSuccessMatchesSharedContractGolden(t *testing.T) {
+	config := decision.Config{RuleSet: testfixture.RuleSet(), CapabilityCatalog: testfixture.Catalog()}
+	optimization := testfixture.Optimization()
+	config.Optimization = &optimization
+	engine, err := decision.NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(nil, nil).WithV3(engine)
+	handler.now = func() time.Time { return testfixture.Now }
+	mux := http.NewServeMux()
+	handler.Register(mux)
+
+	request := httptest.NewRequest(http.MethodPost, "/internal/v3/routing-decisions", bytes.NewReader(testfixture.RiskContextGolden))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("v3 golden request status=%d body=%s", response.Code, response.Body.String())
+	}
+	if !bytes.Equal(response.Body.Bytes(), testfixture.RoutingV3SuccessGolden) {
+		t.Fatalf("Router v3 response drifted from the shared contract golden\nwant: %s\n got: %s", testfixture.RoutingV3SuccessGolden, response.Body.Bytes())
+	}
+
+	var result decision.Decision
+	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+		t.Fatal(err)
+	}
+	contentID := result.ID
+	result.ID = ""
+	canonical, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(canonical)
+	if want := "rtd_" + hex.EncodeToString(digest[:16]); contentID != want {
+		t.Fatalf("decision id is not bound to the complete response: got %s want %s", contentID, want)
+	}
+	if result.ExecutableUntil != testfixture.Now.Add(5*time.Minute) || result.Risk == nil || result.Risk.Action != "allow" || !result.Risk.Continue || len(result.Risk.RequiredCapabilities) != 0 || result.Optimization == nil {
+		t.Fatalf("v3 golden omitted deadline, allow Risk, or Optimization evidence: %+v", result)
+	}
+	score := result.Optimization.Scoring
+	if score.Status != "scored" || score.Mode != "full_v1" || len(score.Breakdown) != 1 || score.Breakdown[0].Numbers == nil {
+		t.Fatalf("scored state-dependent shape is incomplete: %+v", score)
+	}
+	row := score.Breakdown[0]
+	if row.Cost.State != "known" || row.Cost.Estimate == nil || len(row.Cost.Estimate.Breakdown) != 6 || row.Performance.State != "known" || row.Performance.Estimate == nil || row.Performance.SourceSegment == nil || row.Performance.ParentSegment != nil {
+		t.Fatalf("known feature evidence has the wrong required/optional shape: %+v", row)
+	}
+	if len(result.Optimization.Classifications) != 1 {
+		t.Fatalf("classification evidence count=%d", len(result.Optimization.Classifications))
+	}
+	classification := result.Optimization.Classifications[0]
+	if classification.State != "not_applicable" || classification.Value != nil || classification.Rule != nil || classification.Country != nil {
+		t.Fatalf("not_applicable classification retained forbidden optional evidence: %+v", classification)
+	}
+}
+
 func TestV2RechecksClockWhenEvaluationCrossesExpiryBoundary(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -217,5 +304,88 @@ func TestV2RechecksClockWhenEvaluationCrossesExpiryBoundary(t *testing.T) {
 				t.Fatalf("expiry boundary was not checked at completion: %d %s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestV2RejectionAlsoRefusesEvidenceThatExpiresDuringEvaluation(t *testing.T) {
+	config := decision.Config{RuleSet: testfixture.RuleSet(), CapabilityCatalog: testfixture.Catalog()}
+	config.RuleSet.ExpiresAt = testfixture.Now.Add(time.Nanosecond)
+	engine, err := decision.NewEngine(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(nil, nil).WithV2(engine)
+	calls := 0
+	handler.now = func() time.Time {
+		calls++
+		if calls == 1 {
+			return testfixture.Now
+		}
+		return testfixture.Now.Add(2 * time.Nanosecond)
+	}
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	payload := strings.Replace(string(testfixture.ContextGolden), `"currency":"USD"`, `"currency":"GBP"`, 1)
+	response := v2Post(mux, payload)
+	if response.Code != http.StatusServiceUnavailable || calls < 2 {
+		t.Fatalf("stale rejection evidence escaped: %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestVersionedHandlersRefuseAnEngineForTheWrongContractAndReadinessExpires(t *testing.T) {
+	plain, err := decision.NewEngine(decision.Config{RuleSet: testfixture.RuleSet(), CapabilityCatalog: testfixture.Catalog()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	optimizedConfig := decision.Config{RuleSet: testfixture.RuleSet(), CapabilityCatalog: testfixture.Catalog()}
+	optimization := testfixture.Optimization()
+	optimizedConfig.Optimization = &optimization
+	optimized, err := decision.NewEngine(optimizedConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := NewHandler(nil, nil).WithV2(optimized).WithV3(plain)
+	handler.now = func() time.Time { return testfixture.Now }
+	mux := http.NewServeMux()
+	handler.Register(mux)
+	for _, path := range []string{"/internal/v2/routing-decisions", "/internal/v3/routing-decisions"} {
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusServiceUnavailable {
+			t.Fatalf("%s accepted the wrong engine: %d %s", path, response.Code, response.Body.String())
+		}
+	}
+	readyHandler := NewHandler(nil, nil).WithV3(optimized).WithRequiredVersion("v3")
+	readyHandler.now = func() time.Time { return testfixture.Now.Add(2 * time.Hour) }
+	readyMux := http.NewServeMux()
+	readyHandler.Register(readyMux)
+	for path, want := range map[string]int{"/livez": http.StatusOK, "/readyz": http.StatusServiceUnavailable} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		readyMux.ServeHTTP(response, request)
+		if response.Code != want {
+			t.Fatalf("%s status=%d body=%s", path, response.Code, response.Body.String())
+		}
+	}
+	freshRules, freshCatalog := testfixture.RuleSet(), testfixture.Catalog()
+	freshRules.ExpiresAt, freshCatalog.ExpiresAt = testfixture.Now.Add(3*time.Hour), testfixture.Now.Add(3*time.Hour)
+	for index := range freshCatalog.Descriptors {
+		freshCatalog.Descriptors[index].ExpiresAt = testfixture.Now.Add(3 * time.Hour)
+	}
+	freshV2, err := decision.NewEngine(decision.Config{RuleSet: freshRules, CapabilityCatalog: freshCatalog})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatible := NewHandler(nil, nil).WithV2(freshV2).WithV3(optimized).WithRequiredVersion("v2")
+	compatible.now = func() time.Time { return testfixture.Now.Add(2 * time.Hour) }
+	compatibleMux := http.NewServeMux()
+	compatible.Register(compatibleMux)
+	request := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	response := httptest.NewRecorder()
+	compatibleMux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expired optional v3 evicted a v2 deployment: %d %s", response.Code, response.Body.String())
 	}
 }

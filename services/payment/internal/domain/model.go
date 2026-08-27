@@ -1,11 +1,14 @@
 package domain
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"reflect"
 	"strings"
 	"time"
+
+	"github.com/YouEclipse/payments/services/payment/internal/recovery"
 )
 
 type IntentStatus string
@@ -131,6 +134,7 @@ type PaymentAttempt struct {
 	RoutingDecisionID          string
 	RoutingContextSnapshot     string
 	RoutingDecisionSnapshot    string
+	RoutingExecutableUntil     *time.Time
 	ProviderConnectionID       string
 	ProviderConnectionRevision string
 	ProviderNamespaceID        string
@@ -166,6 +170,16 @@ type ProviderOperation struct {
 	ProviderCode               string
 	RetryCount                 int
 	NextRetryAt                *time.Time
+	FirstDispatchedAt          *time.Time
+	RecoveryDeadlineAt         time.Time
+	RecoveryBudgetRemaining    int
+	RecoveryPolicyVersion      string
+	RecoveryLeaseUntil         *time.Time
+	RecoveryClaimGeneration    int64
+	RecoveryClaimBasis         recovery.ClaimBasis
+	RecoveryAction             recovery.Action
+	RecoveryStopReason         string
+	RecoveryEvidence           *recovery.AbsenceEvidence
 	LastError                  string
 	Version                    int64
 	CreatedAt                  time.Time
@@ -276,21 +290,61 @@ func PrepareConfirmation(intent *PaymentIntent, attempt *PaymentAttempt, operati
 	operation.SideEffectCertainty = SideEffectNone
 	operation.RetryMode = RetrySameKey
 	operation.UpdatedAt = now.UTC()
+	operation.RecoveryDeadlineAt = operation.CreatedAt.UTC().Add(recovery.Window)
+	operation.RecoveryBudgetRemaining = recovery.InitialBudget
+	operation.RecoveryPolicyVersion = recovery.PolicyVersion
+	operation.RecoveryClaimBasis = recovery.ClaimNone
+	operation.RecoveryAction = recovery.Wait
 	return nil
 }
 
 func MarkSending(intent *PaymentIntent, attempt *PaymentAttempt, operation *ProviderOperation, now time.Time) error {
-	if operation.Status != OperationCreated && operation.Status != OperationRetryScheduled && operation.Status != OperationUnknown {
+	if operation.Status != OperationCreated || operation.SideEffectCertainty != SideEffectNone || operation.FirstDispatchedAt != nil {
 		return fmt.Errorf("%w: operation %s cannot send from %s", ErrInvalidTransition, operation.ID, operation.Status)
 	}
+	return markSending(intent, attempt, operation, now)
+}
+
+// MarkRecoverySending cannot be invoked using a retry hint or an HTTP status.
+// An existing operation needs fresh absence evidence bound to its entire
+// immutable execution identity and payload. A new CREATED row is the durable
+// proof that this process has not crossed its dispatch marker yet.
+func MarkRecoverySending(intent *PaymentIntent, attempt *PaymentAttempt, operation *ProviderOperation, now time.Time) error {
+	if operation.Status == OperationCreated && operation.SideEffectCertainty == SideEffectNone && operation.FirstDispatchedAt == nil {
+		return MarkSending(intent, attempt, operation, now)
+	}
+	if operation.Status != OperationSending && operation.Status != OperationUnknown && operation.Status != OperationPending && operation.Status != OperationRetryScheduled {
+		return fmt.Errorf("%w: operation cannot recover from %s", ErrInvalidTransition, operation.Status)
+	}
+	if operation.RecoveryEvidence == nil || !operation.RecoveryEvidence.ValidFor(operation.RecoveryIdentity(), now) {
+		return fmt.Errorf("%w: fresh same-operation absence evidence is required", ErrInvalidTransition)
+	}
+	return markSending(intent, attempt, operation, now)
+}
+
+func (operation ProviderOperation) RecoveryIdentity() recovery.Identity {
+	return recovery.Identity{
+		OperationID: operation.ID, AttemptID: operation.PaymentAttemptID,
+		ConnectionID: operation.ProviderConnectionID, ConnectionRevision: operation.ProviderConnectionRevision,
+		NamespaceID: operation.ProviderNamespaceID, Provider: operation.Provider,
+		Key: operation.ProviderIdempotencyKey, PayloadHash: hex.EncodeToString(operation.RequestHash),
+	}
+}
+
+func markSending(intent *PaymentIntent, attempt *PaymentAttempt, operation *ProviderOperation, now time.Time) error {
 	if isTerminalAttempt(attempt.Status) || intent.WinningAttemptID != "" {
 		return fmt.Errorf("%w: a terminal or winning attempt cannot be sent again", ErrInvalidTransition)
+	}
+	if operation.Status == OperationCreated && operation.FirstDispatchedAt == nil {
+		first := now.UTC()
+		operation.FirstDispatchedAt = &first
 	}
 	operation.Status = OperationSending
 	operation.SideEffectCertainty = SideEffectPossible
 	operation.RetryMode = RetryQueryOrWait
 	operation.RetryCount++
 	operation.NextRetryAt = nil
+	operation.RecoveryEvidence = nil
 	operation.UpdatedAt = now.UTC()
 	operation.Version++
 	attempt.Status = AttemptProcessing
@@ -334,6 +388,13 @@ func ApplyProviderOutcome(intent *PaymentIntent, attempt *PaymentAttempt, operat
 	beforeAttempt := *attempt
 	beforeOperation := cloneOperation(*operation)
 	finish := func(conflict bool, transitionErr error) (ApplyResult, error) {
+		if operation.Status == OperationSucceeded || operation.Status == OperationFailed {
+			operation.RecoveryLeaseUntil = nil
+			operation.RecoveryEvidence = nil
+			operation.RecoveryClaimBasis = recovery.ClaimNone
+			operation.RecoveryAction = recovery.Stop
+			operation.RecoveryStopReason = "terminal_operation"
+		}
 		intentChanged := !sameIntentState(beforeIntent, *intent)
 		attemptChanged := !sameAttemptState(beforeAttempt, *attempt)
 		operationChanged := !sameOperationState(beforeOperation, *operation)
@@ -364,11 +425,6 @@ func ApplyProviderOutcome(intent *PaymentIntent, attempt *PaymentAttempt, operat
 			Conflict:      conflict,
 		}, transitionErr
 	}
-	if operation.Status == OperationReviewRequired {
-		intent.IntegrityStatus = IntegrityReviewRequired
-		return finish(true, ErrConflictingOutcome)
-	}
-
 	if outcome.ProviderPaymentReference != "" {
 		if attempt.ProviderPaymentReference != "" && attempt.ProviderPaymentReference != outcome.ProviderPaymentReference {
 			intent.IntegrityStatus = IntegrityReviewRequired
@@ -395,6 +451,19 @@ func ApplyProviderOutcome(intent *PaymentIntent, attempt *PaymentAttempt, operat
 			firstNonEmpty(outcome.NormalizedCode, outcome.ProviderCode, "provider_review_required"),
 			outcome.Message,
 		)
+		return finish(true, ErrConflictingOutcome)
+	}
+	if operation.Status == OperationReviewRequired {
+		// Review is an authority boundary, not missing provider evidence. Keep
+		// non-conflicting late references and diagnostics for investigation, but
+		// never let an asynchronous observation restart recovery or mutate funds.
+		if outcome.ProviderCode != "" {
+			operation.ProviderCode = outcome.ProviderCode
+		}
+		if outcome.Message != "" {
+			operation.LastError = outcome.Message
+		}
+		intent.IntegrityStatus = IntegrityReviewRequired
 		return finish(true, ErrConflictingOutcome)
 	}
 
@@ -560,6 +629,11 @@ func applyManualReviewState(intent *PaymentIntent, attempt *PaymentAttempt, oper
 	}
 	operation.NormalizedCode = firstNonEmpty(code, "manual_review_required")
 	operation.LastError = message
+	operation.RecoveryLeaseUntil = nil
+	operation.RecoveryEvidence = nil
+	operation.RecoveryClaimBasis = recovery.ClaimNone
+	operation.RecoveryAction = recovery.Stop
+	operation.RecoveryStopReason = operation.NormalizedCode
 }
 
 func applyUnknown(intent *PaymentIntent, attempt *PaymentAttempt, operation *ProviderOperation, now time.Time, preservePending bool) {
@@ -582,21 +656,27 @@ func applyUnknown(intent *PaymentIntent, attempt *PaymentAttempt, operation *Pro
 
 func scheduleRecovery(operation *ProviderOperation, now time.Time) {
 	operation.RetryCount++
-	shift := operation.RetryCount
-	if shift < 1 {
-		shift = 1
-	}
-	if shift > 8 {
-		shift = 8
-	}
-	delay := time.Duration(1<<shift) * time.Second
-	next := now.UTC().Add(delay)
+	// RetryCount is a legacy observation/backoff ordinal, not a call budget.
+	// Only the durable claim transaction charges RecoveryBudgetRemaining.
+	next := recovery.NextAttemptAt(operation.ID, operation.RetryCount, now.UTC(), operation.RecoveryDeadlineAt)
 	operation.NextRetryAt = &next
 }
 
 func cloneOperation(operation ProviderOperation) ProviderOperation {
 	clone := operation
 	clone.RequestHash = append([]byte(nil), operation.RequestHash...)
+	if operation.FirstDispatchedAt != nil {
+		first := *operation.FirstDispatchedAt
+		clone.FirstDispatchedAt = &first
+	}
+	if operation.RecoveryLeaseUntil != nil {
+		lease := *operation.RecoveryLeaseUntil
+		clone.RecoveryLeaseUntil = &lease
+	}
+	if operation.RecoveryEvidence != nil {
+		evidence := *operation.RecoveryEvidence
+		clone.RecoveryEvidence = &evidence
+	}
 	if operation.NextRetryAt != nil {
 		next := *operation.NextRetryAt
 		clone.NextRetryAt = &next

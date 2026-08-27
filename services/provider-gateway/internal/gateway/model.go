@@ -1,6 +1,9 @@
 package gateway
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	StatusCreated   = "created"
@@ -35,6 +38,7 @@ type ProviderConnectionRevisionBinding struct {
 	ProviderConnectionIdentity
 	FingerprintVersion int
 	ConfigFingerprint  string
+	ConclusiveAbsence  bool
 }
 
 type OperationRequest struct {
@@ -52,22 +56,23 @@ type OperationRequest struct {
 }
 
 type Operation struct {
-	OperationID                string    `json:"operation_id"`
-	AttemptID                  string    `json:"attempt_id"`
-	ProviderConnectionID       string    `json:"provider_connection_id"`
-	ProviderConnectionRevision string    `json:"provider_connection_revision"`
-	ProviderNamespaceID        string    `json:"provider_namespace_id"`
-	Provider                   string    `json:"provider"`
-	ProviderIdempotencyKey     string    `json:"provider_idempotency_key"`
-	RequestHash                string    `json:"-"`
-	RequestHashVersion         int       `json:"-"`
-	LegacyRequestHash          string    `json:"-"`
-	Status                     string    `json:"status"`
-	SideEffectCertainty        string    `json:"side_effect_certainty"`
-	ProviderReference          string    `json:"provider_reference,omitempty"`
-	FailureCode                string    `json:"failure_code,omitempty"`
-	CreatedAt                  time.Time `json:"created_at"`
-	UpdatedAt                  time.Time `json:"updated_at"`
+	OperationID                string     `json:"operation_id"`
+	AttemptID                  string     `json:"attempt_id"`
+	ProviderConnectionID       string     `json:"provider_connection_id"`
+	ProviderConnectionRevision string     `json:"provider_connection_revision"`
+	ProviderNamespaceID        string     `json:"provider_namespace_id"`
+	Provider                   string     `json:"provider"`
+	ProviderIdempotencyKey     string     `json:"provider_idempotency_key"`
+	RequestHash                string     `json:"-"`
+	RequestHashVersion         int        `json:"-"`
+	LegacyRequestHash          string     `json:"-"`
+	Status                     string     `json:"status"`
+	SideEffectCertainty        string     `json:"side_effect_certainty"`
+	ProviderReference          string     `json:"provider_reference,omitempty"`
+	FailureCode                string     `json:"failure_code,omitempty"`
+	FirstDispatchedAt          *time.Time `json:"-"`
+	CreatedAt                  time.Time  `json:"created_at"`
+	UpdatedAt                  time.Time  `json:"updated_at"`
 }
 
 type ProviderOutcome struct {
@@ -93,11 +98,44 @@ type VerifiedWebhookEvent struct {
 	AllowedOperationIdentities map[string]ProviderConnectionIdentity
 	EventID                    string
 	OperationID                string
+	RawProviderStatus          string
 	Status                     string
 	SideEffectCertainty        string
 	ProviderReference          string
 	FailureCode                string
 	OccurredAt                 time.Time
+	SanitizedPayload           json.RawMessage
+}
+
+const (
+	ObservationSourceSale       = "sale"
+	ObservationSourceQuery      = "query"
+	ObservationSourceWebhook    = "webhook"
+	ObservationSourceLegacySeed = "legacy_seed"
+)
+
+// ProviderOperationObservation is an immutable, sanitized fact received from
+// a Provider boundary. Repeated Provider event IDs are intentionally allowed:
+// the ledger records deliveries and does not promise Provider exactly-once.
+type ProviderOperationObservation struct {
+	ID                          int64           `json:"id"`
+	OperationID                 string          `json:"operation_id"`
+	AttemptID                   string          `json:"attempt_id"`
+	ProviderConnectionID        string          `json:"provider_connection_id"`
+	ProviderConnectionRevision  string          `json:"provider_connection_revision"`
+	ProviderNamespaceID         string          `json:"provider_namespace_id"`
+	Provider                    string          `json:"provider"`
+	Source                      string          `json:"source"`
+	RawProviderStatus           string          `json:"raw_provider_status"`
+	NormalizedStatus            string          `json:"normalized_status"`
+	NormalizedCertainty         string          `json:"normalized_certainty"`
+	NormalizedProviderReference string          `json:"normalized_provider_reference,omitempty"`
+	NormalizedFailureCode       string          `json:"normalized_failure_code,omitempty"`
+	ProviderEventID             string          `json:"provider_event_id,omitempty"`
+	PayloadHash                 string          `json:"payload_hash"`
+	SanitizedPayload            json.RawMessage `json:"sanitized_payload"`
+	ObservedAt                  time.Time       `json:"observed_at"`
+	CreatedAt                   time.Time       `json:"created_at"`
 }
 
 type OutboxItem struct {

@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// FingerprintVersion labels the existing operation + NUL + typed JSON bytes.
+// Changing it requires an explicit migration, not silently reusing old keys.
+const FingerprintVersion = "command_sha256.v1"
+
 var (
 	ErrKeyRequired = errors.New("Idempotency-Key is required")
 	ErrKeyTooLong  = errors.New("Idempotency-Key must not exceed 255 bytes")

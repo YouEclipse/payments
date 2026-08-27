@@ -23,10 +23,12 @@ type decisionEngine interface {
 
 // Handler exposes the router's internal HTTP API.
 type Handler struct {
-	engine decisionEngine
-	v2     *decision.Engine
-	now    func() time.Time
-	logger *slog.Logger
+	engine          decisionEngine
+	v2              *decision.Engine
+	v3              *decision.Engine
+	now             func() time.Time
+	logger          *slog.Logger
+	requiredVersion string
 }
 
 func NewHandler(engine decisionEngine, logger *slog.Logger) *Handler {
@@ -38,7 +40,29 @@ func NewHandler(engine decisionEngine, logger *slog.Logger) *Handler {
 
 // WithV2 installs an independently configured reader-first v2 engine. Nil
 // deliberately leaves v2 unavailable; it never changes the legacy v1 engine.
-func (h *Handler) WithV2(engine *decision.Engine) *Handler { h.v2 = engine; return h }
+func (h *Handler) WithV2(engine *decision.Engine) *Handler {
+	if engine != nil && !engine.OptimizationConfigured() {
+		h.v2 = engine
+	}
+	return h
+}
+
+// WithV3 installs the risk-gated optimization pipeline without changing the
+// retained v1/v2 endpoint behavior or silently upgrading their input schemas.
+func (h *Handler) WithV3(engine *decision.Engine) *Handler {
+	if engine != nil && engine.OptimizationConfigured() {
+		h.v3 = engine
+	}
+	return h
+}
+
+// WithRequiredVersion scopes process readiness to the API contract assigned to
+// this deployment. An optional expired reader must not evict pods serving a
+// different, still-valid reader-first version.
+func (h *Handler) WithRequiredVersion(version string) *Handler {
+	h.requiredVersion = version
+	return h
+}
 
 func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/livez", h.health)
@@ -46,6 +70,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", h.metrics)
 	mux.HandleFunc("/internal/v1/routing-decisions", h.routingDecisions)
 	mux.HandleFunc("/internal/v2/routing-decisions", h.routingDecisionsV2)
+	mux.HandleFunc("/internal/v3/routing-decisions", h.routingDecisionsV3)
 }
 
 func (h *Handler) metrics(w http.ResponseWriter, r *http.Request) {
@@ -66,6 +91,16 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 			Message: "only GET is supported",
 		})
 		return
+	}
+	if r.URL.Path == "/readyz" {
+		now := h.now().UTC()
+		unavailable := (h.requiredVersion == "v2" && (h.v2 == nil || !h.v2.ReadyAt(now))) ||
+			(h.requiredVersion == "v3" && (h.v3 == nil || !h.v3.ReadyAt(now))) ||
+			(h.requiredVersion != "" && h.requiredVersion != "v1" && h.requiredVersion != "v2" && h.requiredVersion != "v3")
+		if unavailable {
+			writeError(w, http.StatusServiceUnavailable, apiError{Code: "routing_snapshot_unavailable", Message: "configured Router snapshots are outside their effective interval"})
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, healthResponse{Status: "ok"})
 }

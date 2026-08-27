@@ -26,6 +26,9 @@ func TestGatewayConfigFailsClosedOutsideDevelopment(t *testing.T) {
 	if cfg.InternalToken != "explicit-internal-token" || cfg.ProviderEndpoints["provider_a"] != "https://provider.example" {
 		t.Fatalf("explicit production configuration was not preserved: %+v", cfg)
 	}
+	if cfg.ProviderConclusiveAbsence["provider_a"] {
+		t.Fatal("production provider gained conclusive-absence authority without explicit configuration")
+	}
 }
 
 func TestGatewayConfigUsesDefaultsOnlyForDevelopment(t *testing.T) {
@@ -42,7 +45,8 @@ func TestGatewayConfigUsesDefaultsOnlyForDevelopment(t *testing.T) {
 		cfg.ProviderConnectionRevisions["simulator_a"] != "legacy_v1" ||
 		cfg.ProviderNamespaceIDs["simulator_a"] != "simulator_a" ||
 		cfg.ProviderRecoveryAliases["simulator_a"] != "simulator_a_us_primary" ||
-		cfg.WebhookSecrets["simulator_a"] != cfg.WebhookSecrets["simulator_a_us_primary"] {
+		cfg.WebhookSecrets["simulator_a"] != cfg.WebhookSecrets["simulator_a_us_primary"] ||
+		!cfg.ProviderConclusiveAbsence["simulator_a"] || !cfg.ProviderConclusiveAbsence["simulator_a_us_primary"] {
 		t.Fatalf("local defaults do not preserve the legacy simulator connection alias: %+v", cfg)
 	}
 }
@@ -96,6 +100,18 @@ func TestParseMapRejectsMalformedOrDuplicateConfiguration(t *testing.T) {
 	}
 }
 
+func TestParseOptionalBoolMapIsExplicitAndRejectsAmbiguity(t *testing.T) {
+	parsed, err := parseOptionalBoolMap("provider_a=true,provider_b=false")
+	if err != nil || !parsed["provider_a"] || parsed["provider_b"] {
+		t.Fatalf("parseOptionalBoolMap() = %+v, %v", parsed, err)
+	}
+	for _, input := range []string{"provider", "provider=maybe", "provider=true,provider=false"} {
+		if _, err := parseOptionalBoolMap(input); err == nil {
+			t.Fatalf("parseOptionalBoolMap(%q) unexpectedly succeeded", input)
+		}
+	}
+}
+
 func TestBoolEnvRejectsInvalidMigrationSetting(t *testing.T) {
 	t.Setenv("MIGRATE_ON_START", "definitely")
 	if _, err := boolEnv("MIGRATE_ON_START", false); err == nil {
@@ -117,6 +133,7 @@ func clearGatewaySettings(t *testing.T) {
 		"PROVIDER_CONNECTION_REVISIONS",
 		"PROVIDER_NAMESPACE_IDS",
 		"PROVIDER_RECOVERY_ALIASES",
+		"PROVIDER_CONCLUSIVE_ABSENCE",
 		"PROVIDER_WEBHOOK_SECRETS",
 		"GATEWAY_WEBHOOK_BASE_URL",
 		"PAYMENT_OUTCOME_URL",

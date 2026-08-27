@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"mime"
@@ -21,11 +20,12 @@ import (
 const maxRequestBody = 64 << 10
 
 type Handler struct {
-	service paymentService
-	store   *postgres.Store
-	auth    *Authenticator
-	logger  *slog.Logger
-	mux     *http.ServeMux
+	service      paymentService
+	store        *postgres.Store
+	auth         *Authenticator
+	logger       *slog.Logger
+	mux          *http.ServeMux
+	maxClockSkew time.Duration
 }
 
 type paymentService interface {
@@ -35,8 +35,15 @@ type paymentService interface {
 	ReceiveProviderOutcome(context.Context, domain.ProviderOutcome, []byte) (app.Result, bool, error)
 }
 
-func NewHandler(service paymentService, store *postgres.Store, auth *Authenticator, logger *slog.Logger) http.Handler {
-	handler := &Handler{service: service, store: store, auth: auth, logger: logger, mux: http.NewServeMux()}
+func NewHandler(service paymentService, store *postgres.Store, auth *Authenticator, logger *slog.Logger, maxClockSkew ...time.Duration) http.Handler {
+	clockSkew := 500 * time.Millisecond
+	if len(maxClockSkew) > 0 {
+		clockSkew = maxClockSkew[0]
+	}
+	handler := &Handler{
+		service: service, store: store, auth: auth, logger: logger,
+		mux: http.NewServeMux(), maxClockSkew: clockSkew,
+	}
 	handler.mux.HandleFunc("GET /livez", handler.livez)
 	handler.mux.HandleFunc("GET /readyz", handler.readyz)
 	handler.mux.HandleFunc("GET /metrics", handler.metrics)
@@ -122,11 +129,11 @@ func (h *Handler) providerOutcome(response http.ResponseWriter, request *http.Re
 		return
 	}
 	var input providerOutcomeRequest
-	if err := decodeJSON(response, request, &input); err != nil {
+	raw, err := decodeJSONObject(response, request, &input)
+	if err != nil {
 		writeError(response, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	raw, _ := json.Marshal(input)
 	outcome, err := clients.NormalizeGatewayResponse(clients.GatewayOperationResponse{
 		OperationID:                input.OperationID,
 		AttemptID:                  input.AttemptID,
@@ -179,8 +186,8 @@ func (h *Handler) livez(response http.ResponseWriter, _ *http.Request) {
 func (h *Handler) readyz(response http.ResponseWriter, request *http.Request) {
 	context, cancel := contextWithTimeout(request, time.Second)
 	defer cancel()
-	if err := h.store.Ping(context); err != nil {
-		writeError(response, http.StatusServiceUnavailable, "not_ready", "database is unavailable")
+	if err := h.store.Ready(context, h.maxClockSkew); err != nil {
+		writeError(response, http.StatusServiceUnavailable, "not_ready", "database or clock witness is unavailable")
 		return
 	}
 	writeJSON(response, http.StatusOK, map[string]string{"status": "ok"})
@@ -222,10 +229,18 @@ func (h *Handler) handleError(response http.ResponseWriter, request *http.Reques
 		writeError(response, http.StatusConflict, "merchant_reference_exists", "merchant_reference already identifies another payment intent")
 	case errors.Is(err, postgres.ErrStateConflict), errors.Is(err, domain.ErrInvalidTransition):
 		writeError(response, http.StatusConflict, "payment_state_conflict", "operation is not allowed from the current payment state")
+	case errors.Is(err, clients.ErrRiskBlocked):
+		writeError(response, http.StatusUnprocessableEntity, "risk_blocked", "risk policy does not allow this payment")
+	case errors.Is(err, clients.ErrAuthenticationRequired):
+		writeError(response, http.StatusUnprocessableEntity, "authentication_unsupported", "this payment requires an authentication flow that is not supported")
+	case errors.Is(err, clients.ErrRiskReviewRequired):
+		writeError(response, http.StatusUnprocessableEntity, "risk_review_required", "risk review is required before a funds operation may be created")
 	case errors.Is(err, clients.ErrNoEligibleProvider):
 		writeError(response, http.StatusUnprocessableEntity, "no_eligible_provider", "no provider is eligible for this payment")
 	case errors.Is(err, clients.ErrUpstream):
 		writeError(response, http.StatusServiceUnavailable, "dependency_unavailable", "an internal dependency is unavailable")
+	case errors.Is(err, postgres.ErrClockSkew):
+		writeError(response, http.StatusServiceUnavailable, "clock_unsafe", "payment processing is paused because clock safety cannot be established")
 	default:
 		h.logger.Error("payment API request failed", slog.String("method", request.Method), slog.String("path", request.URL.Path), slog.String("error", err.Error()))
 		writeError(response, http.StatusInternalServerError, "internal_error", "the request could not be completed")
@@ -267,16 +282,8 @@ func requireNoBody(response http.ResponseWriter, request *http.Request) bool {
 }
 
 func decodeJSON(response http.ResponseWriter, request *http.Request, target any) error {
-	request.Body = http.MaxBytesReader(response, request.Body, maxRequestBody)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
-		return fmt.Errorf("invalid JSON body: %w", err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain exactly one JSON value")
-	}
-	return nil
+	_, err := decodeJSONObject(response, request, target)
+	return err
 }
 
 func writeJSON(response http.ResponseWriter, status int, payload any) {

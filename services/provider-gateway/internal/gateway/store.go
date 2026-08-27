@@ -27,7 +27,11 @@ const gatewayMigrationLockID int64 = 710_130_613
 type Store interface {
 	CreateOrGet(context.Context, Operation) (Operation, bool, error)
 	Get(context.Context, string) (Operation, error)
+	ClaimDispatch(context.Context, Operation, time.Duration) (Operation, bool, error)
+	DispatchInFlight(context.Context, string) (bool, error)
 	SetStatus(context.Context, string, string, string, string, string) (Operation, error)
+	ApplyProviderObservation(context.Context, ProviderOperationObservation, *Operation) (Operation, bool, error)
+	ListProviderObservations(context.Context, string) ([]ProviderOperationObservation, error)
 	ApplyWebhook(context.Context, VerifiedWebhookEvent) (ProviderOutcome, bool, error)
 	PendingOutbox(context.Context, int) ([]OutboxItem, error)
 	MarkOutboxDelivered(context.Context, int64) error
@@ -41,6 +45,15 @@ var initialMigration string
 
 //go:embed migrations/0002_provider_connection_identity.sql
 var providerConnectionMigration string
+
+//go:embed migrations/0003_recovery_invariants.sql
+var recoveryInvariantMigration string
+
+//go:embed migrations/0004_provider_operation_observations.sql
+var providerObservationMigration string
+
+//go:embed migrations/0005_append_only_truncate_guards.sql
+var appendOnlyGuardMigration string
 
 type PostgresStore struct {
 	pool *pgxpool.Pool
@@ -93,6 +106,9 @@ func migrateGateway(ctx context.Context, pool *pgxpool.Pool) error {
 	}{
 		{version: "0001_init.sql", body: initialMigration},
 		{version: "0002_provider_connection_identity.sql", body: providerConnectionMigration},
+		{version: "0003_recovery_invariants.sql", body: recoveryInvariantMigration},
+		{version: "0004_provider_operation_observations.sql", body: providerObservationMigration},
+		{version: "0005_append_only_truncate_guards.sql", body: appendOnlyGuardMigration},
 	} {
 		checksum := sha256.Sum256([]byte(migration.body))
 		var storedChecksum []byte
@@ -137,7 +153,10 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 	}
 	// Readiness requires the owned schema, not merely a reachable PostgreSQL
 	// server. This fails closed when migrations were not applied.
-	_, err := s.pool.Exec(ctx, `SELECT 1 FROM provider_gateway.operations LIMIT 0`)
+	if _, err := s.pool.Exec(ctx, `SELECT 1 FROM provider_gateway.operations LIMIT 0`); err != nil {
+		return err
+	}
+	_, err := s.pool.Exec(ctx, `SELECT 1 FROM provider_gateway.provider_operation_observations LIMIT 0`)
 	return err
 }
 
@@ -178,21 +197,30 @@ func (s *PostgresStore) BindConnectionRevisions(ctx context.Context, configured 
 		binding := configured[connectionID]
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO provider_gateway.provider_connection_revisions
-			(provider_connection_id,provider_connection_revision,provider_namespace_id,provider,fingerprint_version,config_fingerprint)
-			VALUES($1,$2,$3,$4,$5,$6)
+			(provider_connection_id,provider_connection_revision,provider_namespace_id,provider,fingerprint_version,config_fingerprint,conclusive_absence)
+			VALUES($1,$2,$3,$4,$5,$6,$7)
 			ON CONFLICT(provider_connection_id,provider_connection_revision) DO NOTHING`,
 			connectionID, binding.ConnectionRevision, binding.NamespaceID, binding.Provider,
-			binding.FingerprintVersion, binding.ConfigFingerprint); err != nil {
+			binding.FingerprintVersion, binding.ConfigFingerprint, binding.ConclusiveAbsence); err != nil {
+			return err
+		}
+		// 0003 deliberately leaves pre-capability rows NULL. The first new binary
+		// adopts one explicit value; the database trigger rejects every rewrite.
+		if _, err := tx.Exec(ctx, `
+			UPDATE provider_gateway.provider_connection_revisions
+			SET conclusive_absence=$3
+			WHERE provider_connection_id=$1 AND provider_connection_revision=$2
+			  AND conclusive_absence IS NULL`, connectionID, binding.ConnectionRevision, binding.ConclusiveAbsence); err != nil {
 			return err
 		}
 		var stored ProviderConnectionRevisionBinding
 		stored.ConnectionRevision = binding.ConnectionRevision
 		if err := tx.QueryRow(ctx, `
-			SELECT provider_namespace_id,provider,fingerprint_version,config_fingerprint
+			SELECT provider_namespace_id,provider,fingerprint_version,config_fingerprint,conclusive_absence
 			FROM provider_gateway.provider_connection_revisions
 			WHERE provider_connection_id=$1 AND provider_connection_revision=$2`,
 			connectionID, binding.ConnectionRevision).Scan(
-			&stored.NamespaceID, &stored.Provider, &stored.FingerprintVersion, &stored.ConfigFingerprint,
+			&stored.NamespaceID, &stored.Provider, &stored.FingerprintVersion, &stored.ConfigFingerprint, &stored.ConclusiveAbsence,
 		); err != nil {
 			return err
 		}
@@ -230,16 +258,19 @@ func (s *PostgresStore) CreateOrGet(ctx context.Context, op Operation) (Operatio
 	tag, err := s.pool.Exec(ctx, `
 		INSERT INTO provider_gateway.operations
 		(operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
-		 provider, provider_idempotency_key, request_hash, request_hash_version, status, side_effect_certainty, created_at, updated_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
+		 provider, provider_idempotency_key, request_hash, request_hash_version, status, side_effect_certainty,
+		 first_dispatched_at, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13)
 		ON CONFLICT (operation_id) DO NOTHING`,
 		op.OperationID, op.AttemptID, op.ProviderConnectionID, op.ProviderConnectionRevision, op.ProviderNamespaceID,
-		op.Provider, op.ProviderIdempotencyKey, op.RequestHash, op.RequestHashVersion, op.Status, op.SideEffectCertainty, op.CreatedAt)
+		op.Provider, op.ProviderIdempotencyKey, op.RequestHash, op.RequestHashVersion, op.Status, op.SideEffectCertainty,
+		op.FirstDispatchedAt, op.CreatedAt)
 	if err != nil {
 		return Operation{}, false, err
 	}
 	if tag.RowsAffected() == 1 {
-		return op, true, nil
+		created, err := s.Get(ctx, op.OperationID)
+		return created, true, err
 	}
 
 	// Rows created before provider connection identity existed retain the v1
@@ -264,7 +295,7 @@ func (s *PostgresStore) CreateOrGet(ctx context.Context, op Operation) (Operatio
 		RETURNING operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
 		          provider_idempotency_key, request_hash, request_hash_version, status,
 		          side_effect_certainty, COALESCE(provider_reference,''),
-		          COALESCE(failure_code,''), created_at, updated_at`,
+		          COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at`,
 		op.OperationID, op.RequestHash, requestHashVersionConnection, requestHashVersionLegacy,
 		op.ProviderConnectionRevision, op.ProviderConnectionID, op.ProviderNamespaceID, op.Provider,
 		op.LegacyRequestHash, op.AttemptID, op.ProviderIdempotencyKey,
@@ -297,12 +328,63 @@ func (s *PostgresStore) Get(ctx context.Context, id string) (Operation, error) {
 	op, err := scanGatewayOperation(s.pool.QueryRow(ctx, `
 		SELECT operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		       provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at
+		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at
 		FROM provider_gateway.operations WHERE operation_id=$1`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Operation{}, ErrNotFound
 	}
 	return op, err
+}
+
+// ClaimDispatch is the last durable ownership check before Provider I/O. The
+// complete immutable command plus the previously observed status/timestamp is
+// a compare-and-swap token. A concurrent worker may observe Sending, but only
+// the worker that advances updated_at may cross the Provider boundary.
+func (s *PostgresStore) ClaimDispatch(ctx context.Context, expected Operation, lease time.Duration) (Operation, bool, error) {
+	if lease <= 0 || (expected.Status != StatusCreated && expected.Status != StatusSending && expected.Status != StatusUnknown) {
+		current, err := s.Get(ctx, expected.OperationID)
+		return current, false, err
+	}
+	claimed, err := scanGatewayOperation(s.pool.QueryRow(ctx, `
+		UPDATE provider_gateway.operations
+		SET status='sending', side_effect_certainty='possible',
+		    first_dispatched_at=COALESCE(first_dispatched_at,GREATEST(clock_timestamp(),created_at)),
+		    dispatch_lease_until=clock_timestamp()+($12 * interval '1 microsecond'),
+		    updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond',created_at)
+		WHERE operation_id=$1 AND attempt_id=$2
+		  AND provider_connection_id=$3 AND provider_connection_revision=$4
+		  AND provider_namespace_id=$5 AND provider=$6
+		  AND provider_idempotency_key=$7 AND request_hash=$8 AND request_hash_version=$9
+		  AND status=$10 AND updated_at=$11
+		  AND status IN ('created','sending','unknown')
+		  AND (dispatch_lease_until IS NULL OR dispatch_lease_until <= clock_timestamp())
+		RETURNING operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id, provider,
+		          provider_idempotency_key, request_hash, request_hash_version, status,
+		          side_effect_certainty, COALESCE(provider_reference,''),
+		          COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at`,
+		expected.OperationID, expected.AttemptID, expected.ProviderConnectionID, expected.ProviderConnectionRevision,
+		expected.ProviderNamespaceID, expected.Provider, expected.ProviderIdempotencyKey, expected.RequestHash,
+		expected.RequestHashVersion, expected.Status, expected.UpdatedAt, lease.Microseconds(),
+	))
+	if err == nil {
+		return claimed, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Operation{}, false, err
+	}
+	current, err := s.Get(ctx, expected.OperationID)
+	return current, false, err
+}
+
+func (s *PostgresStore) DispatchInFlight(ctx context.Context, operationID string) (bool, error) {
+	var inFlight bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT COALESCE(dispatch_lease_until > clock_timestamp(),false)
+		FROM provider_gateway.operations WHERE operation_id=$1`, operationID).Scan(&inFlight)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	return inFlight, err
 }
 
 func (s *PostgresStore) SetStatus(ctx context.Context, id, status, certainty, reference, failureCode string) (Operation, error) {
@@ -311,7 +393,7 @@ func (s *PostgresStore) SetStatus(ctx context.Context, id, status, certainty, re
 		return Operation{}, err
 	}
 	defer tx.Rollback(ctx)
-	op, collisionOwner, err := applyStatusPostgres(ctx, tx, id, status, certainty, reference, failureCode)
+	op, collisionOwner, _, err := applyStatusPostgres(ctx, tx, id, status, certainty, reference, failureCode, nil)
 	if err != nil {
 		return Operation{}, err
 	}
@@ -326,58 +408,76 @@ func (s *PostgresStore) SetStatus(ctx context.Context, id, status, certainty, re
 	return op, nil
 }
 
-func applyStatusPostgres(ctx context.Context, tx pgx.Tx, id, status, certainty, reference, failureCode string) (Operation, *Operation, error) {
+// SetStatusIfCurrent is the state-only CAS primitive retained for reducer
+// tests. Provider boundary code must use ApplyProviderObservation so evidence
+// and the state transition share one transaction.
+func (s *PostgresStore) SetStatusIfCurrent(ctx context.Context, expected Operation, status, certainty, reference, failureCode string) (Operation, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	defer tx.Rollback(ctx)
+	op, collisionOwner, applied, err := applyStatusPostgres(
+		ctx, tx, expected.OperationID, status, certainty, reference, failureCode, &expected,
+	)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	if collisionOwner != nil {
+		if err := enqueueReferenceCollisionOutbox(ctx, tx, *collisionOwner, op.OperationID); err != nil {
+			return Operation{}, false, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return Operation{}, false, err
+	}
+	return op, applied, nil
+}
+
+func applyStatusPostgres(ctx context.Context, tx pgx.Tx, id, status, certainty, reference, failureCode string, expected *Operation) (Operation, *Operation, bool, error) {
 	locked, err := scanGatewayOperation(tx.QueryRow(ctx, `
 		SELECT operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		       provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at
+		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at
 		FROM provider_gateway.operations WHERE operation_id=$1 FOR UPDATE`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Operation{}, nil, ErrNotFound
+		return Operation{}, nil, false, ErrNotFound
 	}
 	if err != nil {
-		return Operation{}, nil, err
+		return Operation{}, nil, false, err
+	}
+	if expected != nil && !dispatchClaimMatches(locked, *expected) {
+		return locked, nil, false, nil
 	}
 
 	if reference != "" {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO provider_gateway.provider_reference_observations(provider_namespace_id,provider_reference,operation_id)
-			VALUES($1,$2,$3)
-			ON CONFLICT(provider_namespace_id,provider_reference,operation_id) DO NOTHING`,
-			locked.ProviderNamespaceID, reference, locked.OperationID); err != nil {
-			return Operation{}, nil, err
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO provider_gateway.provider_reference_claims(provider_namespace_id,provider_reference,operation_id)
-			VALUES($1,$2,$3)
-			ON CONFLICT(provider_namespace_id,provider_reference) DO NOTHING`,
-			locked.ProviderNamespaceID, reference, locked.OperationID); err != nil {
-			return Operation{}, nil, err
-		}
-		var ownerID string
-		if err := tx.QueryRow(ctx, `
-			SELECT operation_id FROM provider_gateway.provider_reference_claims
-			WHERE provider_namespace_id=$1 AND provider_reference=$2`,
-			locked.ProviderNamespaceID, reference).Scan(&ownerID); err != nil {
-			return Operation{}, nil, err
+		ownerID, err := recordProviderReferencePostgres(ctx, tx, locked, reference)
+		if err != nil {
+			return Operation{}, nil, false, err
 		}
 		if ownerID != locked.OperationID {
 			owner, err := markProviderReferenceCollision(ctx, tx, ownerID, reference)
 			if err != nil {
-				return Operation{}, nil, err
+				return Operation{}, nil, false, err
 			}
 			current, err := markProviderReferenceCollision(ctx, tx, locked.OperationID, reference)
 			if err != nil {
-				return Operation{}, nil, err
+				return Operation{}, nil, false, err
 			}
-			return current, &owner, nil
+			return current, &owner, true, nil
 		}
 	}
 
 	updated, err := scanGatewayOperation(tx.QueryRow(ctx, `
 		UPDATE provider_gateway.operations
-		SET status = CASE
+		SET first_dispatched_at = CASE
+		      WHEN first_dispatched_at IS NULL AND $2 = 'sending' THEN GREATEST(clock_timestamp(),created_at)
+		      ELSE first_dispatched_at END,
+		    dispatch_lease_until = NULL,
+		    status = CASE
 		      WHEN status = 'review_required' THEN status
+		      WHEN status <> 'created' AND $2 = 'created' THEN status
+		      WHEN status = 'created' AND $2 IN ('unknown','succeeded','failed') THEN 'review_required'
 		      WHEN provider_reference IS NOT NULL AND $4 <> '' AND provider_reference <> $4 THEN 'review_required'
 		      WHEN status='failed' AND $2='unknown' AND ($4 <> '' OR $5='authorization_only') THEN 'review_required'
 		      WHEN $2='failed' AND status IN ('created','sending','unknown') AND (provider_reference IS NOT NULL OR failure_code='authorization_only') THEN 'review_required'
@@ -386,6 +486,8 @@ func applyStatusPostgres(ctx context.Context, tx pgx.Tx, id, status, certainty, 
 		      ELSE $2 END,
 		    side_effect_certainty = CASE
 		      WHEN status = 'review_required' THEN side_effect_certainty
+		      WHEN status <> 'created' AND $2 = 'created' THEN side_effect_certainty
+		      WHEN status = 'created' AND $2 IN ('unknown','succeeded','failed') THEN 'possible'
 		      WHEN provider_reference IS NOT NULL AND $4 <> '' AND provider_reference <> $4 THEN 'possible'
 		      WHEN status='failed' AND $2='unknown' AND ($4 <> '' OR $5='authorization_only') THEN 'possible'
 		      WHEN $2='failed' AND status IN ('created','sending','unknown') AND (provider_reference IS NOT NULL OR failure_code='authorization_only') THEN 'possible'
@@ -397,6 +499,7 @@ func applyStatusPostgres(ctx context.Context, tx pgx.Tx, id, status, certainty, 
 		      ELSE COALESCE(NULLIF($4,''),provider_reference) END,
 			    failure_code=CASE
 			      WHEN status = 'review_required' THEN failure_code
+			      WHEN status = 'created' AND $2 IN ('unknown','succeeded','failed') THEN 'provider_evidence_without_dispatch_record'
 			      WHEN provider_reference IS NOT NULL AND $4 <> '' AND provider_reference <> $4 THEN 'provider_reference_conflict'
 		      WHEN status='failed' AND $2='unknown' AND ($4 <> '' OR $5='authorization_only') THEN 'authorization_failure_conflict'
 		      WHEN $2='failed' AND status IN ('created','sending','unknown') AND (provider_reference IS NOT NULL OR failure_code='authorization_only') THEN 'authorization_failure_conflict'
@@ -405,31 +508,55 @@ func applyStatusPostgres(ctx context.Context, tx pgx.Tx, id, status, certainty, 
 		      WHEN status IN ('succeeded','failed') AND $2 IN ('succeeded','failed') AND status <> $2 THEN failure_code
 		      WHEN $2='succeeded' THEN NULL
 		      ELSE COALESCE(NULLIF($5,''),failure_code) END,
-		    updated_at=now()
+		    updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond',created_at)
 		WHERE operation_id=$1
 		RETURNING operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		          provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at`,
+		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at`,
 		id, status, certainty, reference, failureCode))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Operation{}, nil, ErrNotFound
+		return Operation{}, nil, false, ErrNotFound
 	}
-	return updated, nil, err
+	return updated, nil, true, err
+}
+
+func recordProviderReferencePostgres(ctx context.Context, tx pgx.Tx, operation Operation, reference string) (string, error) {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO provider_gateway.provider_reference_observations(provider_namespace_id,provider_reference,operation_id)
+		VALUES($1,$2,$3)
+		ON CONFLICT(provider_namespace_id,provider_reference,operation_id) DO NOTHING`,
+		operation.ProviderNamespaceID, reference, operation.OperationID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO provider_gateway.provider_reference_claims(provider_namespace_id,provider_reference,operation_id)
+		VALUES($1,$2,$3)
+		ON CONFLICT(provider_namespace_id,provider_reference) DO NOTHING`,
+		operation.ProviderNamespaceID, reference, operation.OperationID); err != nil {
+		return "", err
+	}
+	var ownerID string
+	err := tx.QueryRow(ctx, `
+		SELECT operation_id FROM provider_gateway.provider_reference_claims
+		WHERE provider_namespace_id=$1 AND provider_reference=$2`,
+		operation.ProviderNamespaceID, reference).Scan(&ownerID)
+	return ownerID, err
 }
 
 func markProviderReferenceCollision(ctx context.Context, tx pgx.Tx, operationID, reference string) (Operation, error) {
 	return scanGatewayOperation(tx.QueryRow(ctx, `
 		UPDATE provider_gateway.operations
 		SET status='review_required',
+		    dispatch_lease_until=NULL,
 		    side_effect_certainty='possible',
 		    provider_reference=COALESCE(provider_reference,NULLIF($2,'')),
 		    failure_code=CASE WHEN status='review_required' AND NULLIF(failure_code,'') IS NOT NULL
 		                      THEN failure_code ELSE 'provider_reference_collision' END,
-		    updated_at=now()
+		    updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond',created_at)
 		WHERE operation_id=$1
 		RETURNING operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		          provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at`,
+		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at`,
 		operationID, reference))
 }
 
@@ -460,14 +587,15 @@ func markWebhookEventCollision(ctx context.Context, tx pgx.Tx, operationID strin
 	return scanGatewayOperation(tx.QueryRow(ctx, `
 		UPDATE provider_gateway.operations
 		SET status='review_required',
+		    dispatch_lease_until=NULL,
 		    side_effect_certainty='possible',
 		    failure_code=CASE WHEN status='review_required' AND NULLIF(failure_code,'') IS NOT NULL
 		                      THEN failure_code ELSE 'webhook_event_collision' END,
-		    updated_at=now()
+		    updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond',created_at)
 		WHERE operation_id=$1
 		RETURNING operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		          provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at`,
+		          side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at`,
 		operationID))
 }
 
@@ -504,7 +632,7 @@ func scanGatewayOperation(row gatewayOperationRow) (Operation, error) {
 		&op.OperationID, &op.AttemptID, &op.ProviderConnectionID, &op.ProviderConnectionRevision,
 		&op.ProviderNamespaceID, &op.Provider,
 		&op.ProviderIdempotencyKey, &op.RequestHash, &op.RequestHashVersion, &op.Status,
-		&op.SideEffectCertainty, &op.ProviderReference, &op.FailureCode, &op.CreatedAt, &op.UpdatedAt,
+		&op.SideEffectCertainty, &op.ProviderReference, &op.FailureCode, &op.FirstDispatchedAt, &op.CreatedAt, &op.UpdatedAt,
 	)
 	return op, err
 }
@@ -513,6 +641,10 @@ func validateCurrentRequestHashes(op Operation) error {
 	if op.ProviderConnectionID == "" || op.ProviderConnectionRevision == "" || op.ProviderNamespaceID == "" || op.Provider == "" ||
 		op.RequestHashVersion != requestHashVersionConnection || op.RequestHash == "" || op.LegacyRequestHash == "" {
 		return errors.New("current and legacy request hashes with an explicit current version are required")
+	}
+	if (op.Status == StatusCreated && op.FirstDispatchedAt != nil) ||
+		(op.Status != StatusCreated && op.Status != StatusReview && op.FirstDispatchedAt == nil) {
+		return errors.New("new provider operation dispatch history is inconsistent")
 	}
 	return nil
 }
@@ -526,7 +658,7 @@ func (s *PostgresStore) ApplyWebhook(ctx context.Context, event VerifiedWebhookE
 	operation, err := scanGatewayOperation(tx.QueryRow(ctx, `
 		SELECT operation_id, attempt_id, provider_connection_id, provider_connection_revision, provider_namespace_id,
 		       provider, provider_idempotency_key, request_hash, request_hash_version, status,
-		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), created_at, updated_at
+		       side_effect_certainty, COALESCE(provider_reference,''), COALESCE(failure_code,''), first_dispatched_at, created_at, updated_at
 		FROM provider_gateway.operations WHERE operation_id=$1 FOR UPDATE`, event.OperationID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ProviderOutcome{}, false, ErrNotFound
@@ -545,12 +677,20 @@ func (s *PostgresStore) ApplyWebhook(ctx context.Context, event VerifiedWebhookE
 		ProviderReference: event.ProviderReference, FailureCode: event.FailureCode, OccurredAt: event.OccurredAt,
 	}
 	rawOutcome := outcome
+	observation, err := bindProviderObservation(operation, webhookProviderObservation(event, rawOutcome))
+	if err != nil {
+		return ProviderOutcome{}, false, err
+	}
+	if _, err := insertProviderObservationPostgres(ctx, tx, observation); err != nil {
+		return ProviderOutcome{}, false, err
+	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO provider_gateway.webhook_events
-		(provider_connection_id,provider_connection_revision,provider_namespace_id,provider,event_id,operation_id,sanitized_payload)
-		VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(provider_namespace_id,event_id) DO NOTHING`,
+		(provider_connection_id,provider_connection_revision,provider_namespace_id,provider,event_id,operation_id,sanitized_payload,provider_payload_hash)
+		VALUES($1,$2,$3,$4,$5,$6,$7,sha256(convert_to(($8::jsonb)::text,'UTF8')))
+		ON CONFLICT(provider_namespace_id,event_id) DO NOTHING`,
 		outcome.ProviderConnectionID, outcome.ProviderConnectionRevision, outcome.ProviderNamespaceID,
-		outcome.Provider, outcome.EventID, outcome.OperationID, mustJSON(rawOutcome))
+		outcome.Provider, outcome.EventID, outcome.OperationID, mustJSON(rawOutcome), observation.SanitizedPayload)
 	if err != nil {
 		return ProviderOutcome{}, false, err
 	}
@@ -558,14 +698,16 @@ func (s *PostgresStore) ApplyWebhook(ctx context.Context, event VerifiedWebhookE
 		var storedOperationID string
 		var samePayload bool
 		if err := tx.QueryRow(ctx, `
-			SELECT operation_id, sanitized_payload = $3::jsonb
+			SELECT operation_id,
+			       sanitized_payload = $3::jsonb
+			       AND (provider_payload_hash IS NULL OR provider_payload_hash = sha256(convert_to(($4::jsonb)::text,'UTF8')))
 			FROM provider_gateway.webhook_events
 			WHERE provider_namespace_id=$1 AND event_id=$2`,
-			outcome.ProviderNamespaceID, outcome.EventID, mustJSON(rawOutcome)).Scan(&storedOperationID, &samePayload); err != nil {
+			outcome.ProviderNamespaceID, outcome.EventID, mustJSON(rawOutcome), observation.SanitizedPayload).Scan(&storedOperationID, &samePayload); err != nil {
 			return ProviderOutcome{}, false, err
 		}
 		if storedOperationID != outcome.OperationID || !samePayload {
-			payloadHash := fmt.Sprintf("%x", sha256.Sum256(mustJSON(rawOutcome)))
+			payloadHash := observation.PayloadHash
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO provider_gateway.webhook_event_conflicts
 				(provider_namespace_id,event_id,operation_id,path_connection_id,path_connection_revision,payload_hash,sanitized_payload)
@@ -595,14 +737,25 @@ func (s *PostgresStore) ApplyWebhook(ctx context.Context, event VerifiedWebhookE
 		}
 		return outcome, false, tx.Commit(ctx)
 	}
-	updated, collisionOwner, err := applyStatusPostgres(ctx, tx, outcome.OperationID, outcome.Status, outcome.SideEffectCertainty, outcome.ProviderReference, outcome.FailureCode)
+	preserveLease, err := preserveActiveLeaseForWebhook(ctx, tx, operation, outcome)
 	if err != nil {
 		return ProviderOutcome{}, false, err
 	}
-	outcome.Status = updated.Status
-	outcome.SideEffectCertainty = updated.SideEffectCertainty
-	outcome.ProviderReference = updated.ProviderReference
-	outcome.FailureCode = updated.FailureCode
+	var collisionOwner *Operation
+	if !preserveLease {
+		updated, owner, _, err := applyStatusPostgres(
+			ctx, tx, outcome.OperationID, outcome.Status, outcome.SideEffectCertainty,
+			outcome.ProviderReference, outcome.FailureCode, nil,
+		)
+		if err != nil {
+			return ProviderOutcome{}, false, err
+		}
+		collisionOwner = owner
+		outcome.Status = updated.Status
+		outcome.SideEffectCertainty = updated.SideEffectCertainty
+		outcome.ProviderReference = updated.ProviderReference
+		outcome.FailureCode = updated.FailureCode
+	}
 	if collisionOwner != nil {
 		if err := enqueueReferenceCollisionOutbox(ctx, tx, *collisionOwner, outcome.OperationID); err != nil {
 			return ProviderOutcome{}, false, err
@@ -617,6 +770,33 @@ func (s *PostgresStore) ApplyWebhook(ctx context.Context, event VerifiedWebhookE
 		return ProviderOutcome{}, false, err
 	}
 	return outcome, true, tx.Commit(ctx)
+}
+
+func preserveActiveLeaseForWebhook(ctx context.Context, tx pgx.Tx, operation Operation, outcome ProviderOutcome) (bool, error) {
+	if outcome.Status != StatusUnknown {
+		return false, nil
+	}
+	var active bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(dispatch_lease_until > clock_timestamp(),false)
+		FROM provider_gateway.operations WHERE operation_id=$1`, operation.OperationID).Scan(&active); err != nil {
+		return false, err
+	}
+	if !active {
+		return false, nil
+	}
+	if outcome.ProviderReference == "" {
+		return true, nil
+	}
+	ownerID, err := recordProviderReferencePostgres(ctx, tx, operation, outcome.ProviderReference)
+	if err != nil {
+		return false, err
+	}
+	if ownerID != operation.OperationID ||
+		(operation.ProviderReference != "" && operation.ProviderReference != outcome.ProviderReference) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (s *PostgresStore) PendingOutbox(ctx context.Context, limit int) ([]OutboxItem, error) {
@@ -706,18 +886,24 @@ type providerReferenceObservationKey struct {
 type MemoryStore struct {
 	mu                    sync.Mutex
 	operations            map[string]Operation
+	dispatchLeases        map[string]time.Time
 	connectionRevisions   map[providerConnectionRevisionKey]ProviderConnectionRevisionBinding
 	events                map[providerEventKey]ProviderOutcome
+	eventPayloadHashes    map[providerEventKey]string
 	referenceClaims       map[providerReferenceKey]string
 	referenceObservations map[providerReferenceObservationKey]struct{}
 	webhookConflicts      map[providerWebhookConflictKey]ProviderOutcome
+	providerObservations  []ProviderOperationObservation
 	outbox                []OutboxItem
 	nextID                int64
+	nextObservationID     int64
 }
 
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		operations: map[string]Operation{}, events: map[providerEventKey]ProviderOutcome{}, referenceClaims: map[providerReferenceKey]string{},
+		operations: map[string]Operation{}, events: map[providerEventKey]ProviderOutcome{},
+		eventPayloadHashes: map[providerEventKey]string{}, referenceClaims: map[providerReferenceKey]string{},
+		dispatchLeases:        map[string]time.Time{},
 		connectionRevisions:   map[providerConnectionRevisionKey]ProviderConnectionRevisionBinding{},
 		referenceObservations: map[providerReferenceObservationKey]struct{}{}, webhookConflicts: map[providerWebhookConflictKey]ProviderOutcome{},
 	}
@@ -811,6 +997,59 @@ func (s *MemoryStore) Get(_ context.Context, id string) (Operation, error) {
 	}
 	return op, nil
 }
+func (s *MemoryStore) ClaimDispatch(_ context.Context, expected Operation, lease time.Duration) (Operation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.operations[expected.OperationID]
+	if !ok {
+		return Operation{}, false, ErrNotFound
+	}
+	if !dispatchClaimMatches(current, expected) ||
+		(current.Status != StatusCreated && current.Status != StatusSending && current.Status != StatusUnknown) {
+		return current, false, nil
+	}
+	now := time.Now().UTC()
+	if deadline, active := s.dispatchLeases[current.OperationID]; active && now.Before(deadline) {
+		return current, false, nil
+	}
+	if lease <= 0 {
+		return current, false, errors.New("dispatch lease must be positive")
+	}
+	claimAt := now
+	if !claimAt.After(current.UpdatedAt) {
+		claimAt = current.UpdatedAt.Add(time.Nanosecond)
+	}
+	current.Status = StatusSending
+	current.SideEffectCertainty = "possible"
+	if current.FirstDispatchedAt == nil {
+		first := claimAt
+		current.FirstDispatchedAt = &first
+	}
+	current.UpdatedAt = claimAt
+	s.operations[current.OperationID] = current
+	s.dispatchLeases[current.OperationID] = now.Add(lease)
+	return current, true, nil
+}
+
+func (s *MemoryStore) DispatchInFlight(_ context.Context, operationID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.operations[operationID]; !exists {
+		return false, ErrNotFound
+	}
+	deadline, exists := s.dispatchLeases[operationID]
+	return exists && time.Now().UTC().Before(deadline), nil
+}
+
+func dispatchClaimMatches(current, expected Operation) bool {
+	return current.OperationID == expected.OperationID && current.AttemptID == expected.AttemptID &&
+		current.ProviderConnectionID == expected.ProviderConnectionID &&
+		current.ProviderConnectionRevision == expected.ProviderConnectionRevision &&
+		current.ProviderNamespaceID == expected.ProviderNamespaceID && current.Provider == expected.Provider &&
+		current.ProviderIdempotencyKey == expected.ProviderIdempotencyKey && current.RequestHash == expected.RequestHash &&
+		current.RequestHashVersion == expected.RequestHashVersion && current.Status == expected.Status &&
+		current.UpdatedAt.Equal(expected.UpdatedAt)
+}
 func (s *MemoryStore) SetStatus(_ context.Context, id, status, certainty, reference, failure string) (Operation, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -824,11 +1063,32 @@ func (s *MemoryStore) SetStatus(_ context.Context, id, status, certainty, refere
 	return op, nil
 }
 
+func (s *MemoryStore) SetStatusIfCurrent(_ context.Context, expected Operation, status, certainty, reference, failure string) (Operation, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.operations[expected.OperationID]
+	if !ok {
+		return Operation{}, false, ErrNotFound
+	}
+	if !dispatchClaimMatches(current, expected) {
+		return current, false, nil
+	}
+	op, collisionOwner, err := s.applyStatusLocked(expected.OperationID, status, certainty, reference, failure)
+	if err != nil {
+		return Operation{}, false, err
+	}
+	if collisionOwner != nil {
+		s.enqueueReferenceCollisionLocked(*collisionOwner, op.OperationID)
+	}
+	return op, true, nil
+}
+
 func (s *MemoryStore) applyStatusLocked(id, status, certainty, reference, failure string) (Operation, *Operation, error) {
 	op, ok := s.operations[id]
 	if !ok {
 		return Operation{}, nil, ErrNotFound
 	}
+	delete(s.dispatchLeases, id)
 	if reference != "" {
 		claimKey := providerReferenceKey{NamespaceID: op.ProviderNamespaceID, Reference: reference}
 		s.referenceObservations[providerReferenceObservationKey{Reference: claimKey, OperationID: op.OperationID}] = struct{}{}
@@ -846,6 +1106,7 @@ func (s *MemoryStore) applyStatusLocked(id, status, certainty, reference, failur
 			op = markMemoryProviderReferenceCollision(op, reference)
 			s.operations[ownerID] = owner
 			s.operations[id] = op
+			delete(s.dispatchLeases, ownerID)
 			return op, &owner, nil
 		}
 	}
@@ -855,6 +1116,7 @@ func (s *MemoryStore) applyStatusLocked(id, status, certainty, reference, failur
 }
 
 func markMemoryProviderReferenceCollision(op Operation, reference string) Operation {
+	now := nextMemoryOperationTime(op)
 	if op.Status != StatusReview || op.FailureCode == "" {
 		op.FailureCode = "provider_reference_collision"
 	}
@@ -863,7 +1125,7 @@ func markMemoryProviderReferenceCollision(op Operation, reference string) Operat
 	if op.ProviderReference == "" {
 		op.ProviderReference = reference
 	}
-	op.UpdatedAt = time.Now().UTC()
+	op.UpdatedAt = now
 	return op
 }
 
@@ -879,6 +1141,10 @@ func (s *MemoryStore) enqueueReferenceCollisionLocked(owner Operation, colliding
 }
 
 func applyOperationStatus(op Operation, status, certainty, reference, failure string) Operation {
+	now := nextMemoryOperationTime(op)
+	if op.FirstDispatchedAt == nil && statusRecordsDispatch(status) {
+		op.FirstDispatchedAt = &now
+	}
 	alreadyReview := op.Status == StatusReview
 	referenceConflict := op.ProviderReference != "" && reference != "" && op.ProviderReference != reference
 	authorizationFailureConflict :=
@@ -887,6 +1153,13 @@ func applyOperationStatus(op Operation, status, certainty, reference, failure st
 				(op.ProviderReference != "" || op.FailureCode == "authorization_only"))
 	if alreadyReview {
 		// Conflicting terminal evidence has already escalated the operation.
+	} else if op.Status != StatusCreated && status == StatusCreated {
+		// Dispatch history is monotonic; a late or invalid command cannot recreate
+		// the Gateway's never-dispatched state.
+	} else if op.Status == StatusCreated &&
+		(status == StatusUnknown || status == StatusSucceeded || status == StatusFailed) {
+		op.Status = StatusReview
+		op.SideEffectCertainty = "possible"
 	} else if referenceConflict || authorizationFailureConflict {
 		op.Status = StatusReview
 		op.SideEffectCertainty = "possible"
@@ -909,13 +1182,31 @@ func applyOperationStatus(op Operation, status, certainty, reference, failure st
 		op.FailureCode = "provider_reference_conflict"
 	} else if authorizationFailureConflict {
 		op.FailureCode = "authorization_failure_conflict"
+	} else if op.Status == StatusReview && op.FirstDispatchedAt == nil &&
+		(status == StatusUnknown || status == StatusSucceeded || status == StatusFailed) {
+		op.FailureCode = "provider_evidence_without_dispatch_record"
 	} else if op.Status == StatusSucceeded {
 		op.FailureCode = ""
 	} else if failure != "" {
 		op.FailureCode = failure
 	}
-	op.UpdatedAt = time.Now().UTC()
+	op.UpdatedAt = now
 	return op
+}
+
+func nextMemoryOperationTime(op Operation) time.Time {
+	now := time.Now().UTC()
+	if !now.After(op.UpdatedAt) {
+		now = op.UpdatedAt.Add(time.Nanosecond)
+	}
+	if now.Before(op.CreatedAt) {
+		now = op.CreatedAt
+	}
+	return now
+}
+
+func statusRecordsDispatch(status string) bool {
+	return status == StatusSending
 }
 func (s *MemoryStore) ApplyWebhook(_ context.Context, event VerifiedWebhookEvent) (ProviderOutcome, bool, error) {
 	s.mu.Lock()
@@ -935,10 +1226,14 @@ func (s *MemoryStore) ApplyWebhook(_ context.Context, event VerifiedWebhookEvent
 		ProviderReference: event.ProviderReference, FailureCode: event.FailureCode, OccurredAt: event.OccurredAt,
 	}
 	rawOutcome := outcome
+	observation, err := bindProviderObservation(op, webhookProviderObservation(event, rawOutcome))
+	if err != nil {
+		return ProviderOutcome{}, false, err
+	}
 	eventKey := providerEventKey{NamespaceID: outcome.ProviderNamespaceID, EventID: outcome.EventID}
 	if stored, ok := s.events[eventKey]; ok {
-		if string(mustJSON(stored)) != string(mustJSON(outcome)) {
-			payloadHash := fmt.Sprintf("%x", sha256.Sum256(mustJSON(rawOutcome)))
+		if string(mustJSON(stored)) != string(mustJSON(outcome)) || s.eventPayloadHashes[eventKey] != observation.PayloadHash {
+			payloadHash := observation.PayloadHash
 			conflictKey := providerWebhookConflictKey{Event: eventKey, PayloadHash: payloadHash}
 			if _, alreadyStored := s.webhookConflicts[conflictKey]; !alreadyStored {
 				s.webhookConflicts[conflictKey] = rawOutcome
@@ -954,32 +1249,67 @@ func (s *MemoryStore) ApplyWebhook(_ context.Context, event VerifiedWebhookEvent
 					if conflicted.Status != StatusReview || conflicted.FailureCode == "" {
 						conflicted.FailureCode = "webhook_event_collision"
 					}
+					now := nextMemoryOperationTime(conflicted)
 					conflicted.Status = StatusReview
 					conflicted.SideEffectCertainty = "possible"
-					conflicted.UpdatedAt = time.Now().UTC()
+					conflicted.UpdatedAt = now
 					s.operations[operationID] = conflicted
 					s.enqueueWebhookEventCollisionLocked(conflicted, outcome.EventID, payloadHash)
 				}
 			}
+			s.appendProviderObservationLocked(observation)
 			return ProviderOutcome{}, false, ErrWebhookEventConflict
 		}
+		s.appendProviderObservationLocked(observation)
 		return outcome, false, nil
 	}
-	op, collisionOwner, err := s.applyStatusLocked(outcome.OperationID, outcome.Status, outcome.SideEffectCertainty, outcome.ProviderReference, outcome.FailureCode)
-	if err != nil {
-		return ProviderOutcome{}, false, err
+	preserveLease := s.preserveActiveLeaseForWebhookLocked(op, outcome)
+	var collisionOwner *Operation
+	if !preserveLease {
+		var err error
+		op, collisionOwner, err = s.applyStatusLocked(
+			outcome.OperationID, outcome.Status, outcome.SideEffectCertainty,
+			outcome.ProviderReference, outcome.FailureCode,
+		)
+		if err != nil {
+			return ProviderOutcome{}, false, err
+		}
+		outcome.Status = op.Status
+		outcome.SideEffectCertainty = op.SideEffectCertainty
+		outcome.ProviderReference = op.ProviderReference
+		outcome.FailureCode = op.FailureCode
 	}
-	outcome.Status = op.Status
-	outcome.SideEffectCertainty = op.SideEffectCertainty
-	outcome.ProviderReference = op.ProviderReference
-	outcome.FailureCode = op.FailureCode
 	s.events[eventKey] = rawOutcome
+	s.eventPayloadHashes[eventKey] = observation.PayloadHash
+	s.appendProviderObservationLocked(observation)
 	if collisionOwner != nil {
 		s.enqueueReferenceCollisionLocked(*collisionOwner, outcome.OperationID)
 	}
 	s.nextID++
 	s.outbox = append(s.outbox, OutboxItem{ID: s.nextID, Outcome: outcome})
 	return outcome, true, nil
+}
+
+func (s *MemoryStore) preserveActiveLeaseForWebhookLocked(operation Operation, outcome ProviderOutcome) bool {
+	if outcome.Status != StatusUnknown {
+		return false
+	}
+	deadline, exists := s.dispatchLeases[operation.OperationID]
+	if !exists || !time.Now().UTC().Before(deadline) {
+		return false
+	}
+	if outcome.ProviderReference == "" {
+		return true
+	}
+	claimKey := providerReferenceKey{NamespaceID: operation.ProviderNamespaceID, Reference: outcome.ProviderReference}
+	s.referenceObservations[providerReferenceObservationKey{Reference: claimKey, OperationID: operation.OperationID}] = struct{}{}
+	ownerID, claimed := s.referenceClaims[claimKey]
+	if !claimed {
+		s.referenceClaims[claimKey] = operation.OperationID
+		ownerID = operation.OperationID
+	}
+	return ownerID == operation.OperationID &&
+		(operation.ProviderReference == "" || operation.ProviderReference == outcome.ProviderReference)
 }
 
 func (s *MemoryStore) enqueueWebhookEventCollisionLocked(operation Operation, providerEventID, payloadHash string) {

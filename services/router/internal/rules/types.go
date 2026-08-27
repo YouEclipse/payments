@@ -84,6 +84,9 @@ type Evaluator struct {
 
 func (e *Evaluator) Version() string { return e.artifact.Version }
 func (e *Evaluator) Digest() string  { return e.digest }
+func (e *Evaluator) ExpiresAt() time.Time {
+	return e.artifact.ExpiresAt
+}
 func (e *Evaluator) ValidAt(at time.Time) bool {
 	return !at.Before(e.artifact.PublishedAt) && !at.Before(e.artifact.EffectiveFrom) && at.Before(e.artifact.ExpiresAt)
 }

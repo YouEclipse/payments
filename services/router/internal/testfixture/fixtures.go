@@ -12,12 +12,18 @@ import (
 	"github.com/YouEclipse/payments/services/router/internal/rules"
 )
 
-// ContextGolden is the single checked-in contract fixture also read by
-// Payment's independent wire golden test. Go tests run in their package dirs.
-var ContextGolden = readGolden()
+// These are the checked-in cross-service contract fixtures. Router generates
+// the v3 response golden from its real engine/HTTP encoder, while Payment reads
+// the same bytes through its independent strict client. Go tests run in their
+// package directories, so paths are relative to this package.
+var (
+	ContextGolden          = readGolden("routing-context-v1.json")
+	RiskContextGolden      = readGolden("routing-context-v2.json")
+	RoutingV3SuccessGolden = readGolden("routing-decision-v3-success.json")
+)
 
-func readGolden() []byte {
-	payload, err := os.ReadFile("../../../../contracts/internal/fixtures/routing-context-v1.json")
+func readGolden(name string) []byte {
+	payload, err := os.ReadFile("../../../../contracts/internal/fixtures/" + name)
 	if err != nil {
 		panic(err)
 	}

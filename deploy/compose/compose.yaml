@@ -52,7 +52,9 @@ services:
       PROVIDER_GATEWAY_BASE_URL: http://gateway:8082
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
       PAYMENT_API_KEYS: ${PAYMENT_API_KEYS:-merchant_demo=local-api-key}
-      PAYMENT_ROUTER_API_VERSION: ${PAYMENT_ROUTER_API_VERSION:-v2}
+      PAYMENT_MAX_CLOCK_SKEW: ${PAYMENT_MAX_CLOCK_SKEW:-500ms}
+      PAYMENT_ROUTER_API_VERSION: ${PAYMENT_ROUTER_API_VERSION:-v3}
+      PAYMENT_RISK_MODE: ${PAYMENT_RISK_MODE:-local_fixture}
       PAYMENT_MERCHANT_PROFILES_JSON: ${PAYMENT_MERCHANT_PROFILES_JSON:-}
     ports:
       - "${PAYMENT_PORT:-8080}:8080"
@@ -84,6 +86,8 @@ services:
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-local-internal-token}
       ROUTER_CONFIG_JSON: ${ROUTER_CONFIG_JSON:-}
       ROUTER_V2_CONFIG_JSON: ${ROUTER_V2_CONFIG_JSON:-}
+      ROUTER_V3_CONFIG_JSON: ${ROUTER_V3_CONFIG_JSON:-}
+      ROUTER_REQUIRED_API_VERSION: ${ROUTER_REQUIRED_API_VERSION:-v3}
     ports:
       - "${ROUTER_PORT:-8081}:8081"
     healthcheck:
@@ -112,6 +116,7 @@ services:
       PROVIDER_CONNECTION_REVISIONS: ${PROVIDER_CONNECTION_REVISIONS:-simulator_a=legacy_v1,simulator_a_us_primary=simulator_a_us_primary_v1,simulator_a_eu_backup=simulator_a_eu_backup_v1}
       PROVIDER_NAMESPACE_IDS: ${PROVIDER_NAMESPACE_IDS:-simulator_a=simulator_a,simulator_a_us_primary=simulator_a,simulator_a_eu_backup=simulator_a}
       PROVIDER_RECOVERY_ALIASES: ${PROVIDER_RECOVERY_ALIASES:-simulator_a=simulator_a_us_primary}
+      PROVIDER_CONCLUSIVE_ABSENCE: ${PROVIDER_CONCLUSIVE_ABSENCE:-simulator_a=true,simulator_a_us_primary=true,simulator_a_eu_backup=true}
       PROVIDER_WEBHOOK_SECRETS: simulator_a=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret},simulator_a_us_primary=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret},simulator_a_eu_backup=${PROVIDER_WEBHOOK_SECRET:-dev-webhook-secret}
       GATEWAY_WEBHOOK_BASE_URL: http://gateway:8082
       PAYMENT_OUTCOME_URL: http://payment:8080/internal/v1/provider-outcomes

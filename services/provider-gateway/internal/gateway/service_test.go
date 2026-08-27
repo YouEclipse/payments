@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -593,6 +594,18 @@ func TestOperationHashV2UsesUnambiguousSemanticEncoding(t *testing.T) {
 	}
 }
 
+func TestOperationHashV2GoldenPaymentContract(t *testing.T) {
+	request := OperationRequest{
+		OperationID: "op_1", AttemptID: "att_1", ProviderConnectionID: "conn_1",
+		ProviderConnectionRevision: "rev_1", ProviderNamespaceID: "ns_1", Provider: "provider_1",
+		AmountMinor: 2599, Currency: "USD", PaymentMethodToken: "pm_1", CaptureMethod: "automatic",
+	}
+	const expected = "9879af8f672f44c4e6fcb44e3f53befba1ef9f75b5df534a9cac489aa50f5d7f"
+	if got := operationHashV2(request); got != expected {
+		t.Fatalf("Payment/Gateway hash contract drifted: %s", got)
+	}
+}
+
 func TestMemoryStoreRejectsLegacyHashConnectionDrift(t *testing.T) {
 	store := NewMemoryStore()
 	legacyInput := testOperationRequest("op_legacy_drift", "provider_a")
@@ -719,7 +732,7 @@ func TestWebhookEventIDCannotBeReusedForAnotherOperation(t *testing.T) {
 			ProviderNamespaceID: "provider_a", Provider: "provider_a",
 			ProviderIdempotencyKey: operationID, RequestHash: "hash_" + operationID,
 			RequestHashVersion: requestHashVersionConnection, LegacyRequestHash: "legacy_hash_" + operationID,
-			Status: StatusUnknown, SideEffectCertainty: "possible", CreatedAt: now, UpdatedAt: now,
+			Status: StatusUnknown, SideEffectCertainty: "possible", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -817,7 +830,7 @@ func TestConflictingTerminalWebhookRequiresReview(t *testing.T) {
 		OperationID: "op_conflict", AttemptID: "attempt_1", ProviderConnectionID: "provider_a",
 		ProviderConnectionRevision: "provider_a_v1", ProviderNamespaceID: "provider_a", Provider: "provider_a",
 		ProviderIdempotencyKey: "op_conflict", RequestHash: "hash", RequestHashVersion: requestHashVersionConnection,
-		LegacyRequestHash: "legacy_hash", Status: StatusFailed, SideEffectCertainty: "none", CreatedAt: now, UpdatedAt: now,
+		LegacyRequestHash: "legacy_hash", Status: StatusFailed, SideEffectCertainty: "none", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -842,7 +855,7 @@ func TestUnknownTransportEvidenceCannotDowngradeSuccess(t *testing.T) {
 		ProviderConnectionRevision: "provider_a_v1", ProviderNamespaceID: "provider_a", Provider: "provider_a",
 		ProviderIdempotencyKey: "op_monotonic", RequestHash: "hash", RequestHashVersion: requestHashVersionConnection,
 		LegacyRequestHash: "legacy_hash", Status: StatusSucceeded, SideEffectCertainty: "confirmed", ProviderReference: "provider_ref",
-		CreatedAt: now, UpdatedAt: now,
+		FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -864,7 +877,7 @@ func TestLateAuthorizationWebhookCannotDowngradeCapturedSuccess(t *testing.T) {
 		ProviderConnectionRevision: "provider_a_v1", ProviderNamespaceID: "provider_a", Provider: "provider_a",
 		ProviderIdempotencyKey: "op_captured", RequestHash: "hash", RequestHashVersion: requestHashVersionConnection,
 		LegacyRequestHash: "legacy_hash", Status: StatusSucceeded,
-		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref", CreatedAt: now, UpdatedAt: now,
+		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -947,7 +960,7 @@ func TestConflictingProviderReferenceRequiresReview(t *testing.T) {
 		ProviderConnectionRevision: "provider_a_v1", ProviderNamespaceID: "provider_a", Provider: "provider_a",
 		ProviderIdempotencyKey: "op_reference", RequestHash: "hash", RequestHashVersion: requestHashVersionConnection,
 		LegacyRequestHash: "legacy_hash", Status: StatusSucceeded,
-		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref_a", CreatedAt: now, UpdatedAt: now,
+		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref_a", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1004,6 +1017,156 @@ func TestCreatedOperationResubmitsTheExactDurableOperation(t *testing.T) {
 	}
 }
 
+func TestDispatchDoesNotPostAfterConcurrentTerminalObservation(t *testing.T) {
+	var postCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		postCalls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+
+	input := testOperationRequest("op_concurrent_terminal", "provider_a")
+	store := NewMemoryStore()
+	created := seedOperation(t, store, input, StatusCreated)
+	now := time.Now().UTC()
+	store.mu.Lock()
+	terminal := store.operations[input.OperationID]
+	terminal.Status = StatusSucceeded
+	terminal.SideEffectCertainty = "confirmed"
+	terminal.ProviderReference = "ref_concurrent_terminal"
+	terminal.FirstDispatchedAt = &now
+	store.operations[input.OperationID] = terminal
+	store.mu.Unlock()
+
+	service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
+	result, err := service.dispatch(t.Context(), input, created)
+	if err != nil || result.Status != StatusSucceeded || postCalls.Load() != 0 {
+		t.Fatalf("concurrent terminal observation was re-dispatched: operation=%+v posts=%d err=%v", result, postCalls.Load(), err)
+	}
+}
+
+func TestConcurrentCreatedOperationHasOneProviderDispatchOwner(t *testing.T) {
+	var postCalls atomic.Int32
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		postCalls.Add(1)
+		entered <- struct{}{}
+		<-release
+		writeJSON(w, http.StatusOK, providerResponse{
+			Provider: "provider_a", OperationID: "op_single_dispatch", ProviderReference: "provider_single_dispatch", Status: "captured",
+		})
+	}))
+	defer provider.Close()
+
+	store := NewMemoryStore()
+	service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
+	input := testOperationRequest("op_single_dispatch", "provider_a")
+	type execution struct {
+		op  Operation
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan execution, 2)
+	for range 2 {
+		go func() {
+			<-start
+			op, err := service.Execute(t.Context(), input)
+			results <- execution{op: op, err: err}
+		}()
+	}
+	close(start)
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatal("no worker reached the Provider boundary")
+	}
+
+	// The non-owner must return the durable Sending observation while the CAS
+	// owner is blocked in Provider I/O. If both workers POST, neither returns.
+	var first execution
+	select {
+	case first = <-results:
+	case <-time.After(time.Second):
+		close(release)
+		t.Fatalf("concurrent worker did not lose dispatch ownership; posts=%d", postCalls.Load())
+	}
+	close(release)
+	second := <-results
+	if first.err != nil || second.err != nil || postCalls.Load() != 1 {
+		t.Fatalf("dispatch ownership result first=%+v second=%+v posts=%d", first, second, postCalls.Load())
+	}
+	if first.op.Status != StatusSending || second.op.Status != StatusSucceeded {
+		t.Fatalf("dispatch owner/observer states first=%+v second=%+v", first.op, second.op)
+	}
+}
+
+func TestLateUnknownCannotOverwriteANewerDispatchClaim(t *testing.T) {
+	store := NewMemoryStore()
+	input := testOperationRequest("op_generation_fence", "provider_a")
+	created := seedOperation(t, store, input, StatusCreated)
+	first, claimed, err := store.ClaimDispatch(t.Context(), created, time.Second)
+	if err != nil || !claimed {
+		t.Fatalf("first dispatch claim=%+v claimed=%v err=%v", first, claimed, err)
+	}
+	store.mu.Lock()
+	store.dispatchLeases[input.OperationID] = time.Now().UTC().Add(-time.Second)
+	store.mu.Unlock()
+	second, claimed, err := store.ClaimDispatch(t.Context(), first, time.Second)
+	if err != nil || !claimed || !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Fatalf("second dispatch claim=%+v claimed=%v err=%v", second, claimed, err)
+	}
+	current, applied, err := store.SetStatusIfCurrent(
+		t.Context(), first, StatusUnknown, "possible", "", "provider_response_unknown",
+	)
+	if err != nil || applied || current.Status != StatusSending || !current.UpdatedAt.Equal(second.UpdatedAt) {
+		t.Fatalf("late first-generation UNKNOWN changed the newer claim: current=%+v applied=%v err=%v", current, applied, err)
+	}
+	current, applied, err = store.SetStatusIfCurrent(
+		t.Context(), second, StatusUnknown, "possible", "", "provider_response_unknown",
+	)
+	if err != nil || !applied || current.Status != StatusUnknown {
+		t.Fatalf("current generation could not record UNKNOWN: current=%+v applied=%v err=%v", current, applied, err)
+	}
+}
+
+func TestLateAuthorizationCannotClearANewerDispatchLease(t *testing.T) {
+	store := NewMemoryStore()
+	input := testOperationRequest("op_late_authorization_fence", "provider_a")
+	created := seedOperation(t, store, input, StatusCreated)
+	first, claimed, err := store.ClaimDispatch(t.Context(), created, time.Second)
+	if err != nil || !claimed {
+		t.Fatalf("first dispatch claim=%+v claimed=%v err=%v", first, claimed, err)
+	}
+	store.mu.Lock()
+	store.dispatchLeases[input.OperationID] = time.Now().UTC().Add(-time.Second)
+	store.mu.Unlock()
+	second, claimed, err := store.ClaimDispatch(t.Context(), first, time.Second)
+	if err != nil || !claimed || !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Fatalf("second dispatch claim=%+v claimed=%v err=%v", second, claimed, err)
+	}
+
+	service := &Service{store: store, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	current, err := service.applyProviderResponse(t.Context(), first, providerResponse{
+		Provider: input.Provider, OperationID: input.OperationID,
+		ProviderReference: "auth_from_old_query", Status: "authorized",
+	}, ObservationSourceQuery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != StatusSending || !current.UpdatedAt.Equal(second.UpdatedAt) || current.ProviderReference != "" {
+		t.Fatalf("late authorization changed newer dispatch generation: current=%+v newer=%+v", current, second)
+	}
+	if active, err := store.DispatchInFlight(t.Context(), input.OperationID); err != nil || !active {
+		t.Fatalf("late authorization cleared newer dispatch lease: active=%v err=%v", active, err)
+	}
+}
+
 func TestExistingSendingOperationQueriesBeforeAnyResubmission(t *testing.T) {
 	var getCalls atomic.Int32
 	var postCalls atomic.Int32
@@ -1026,6 +1189,7 @@ func TestExistingSendingOperationQueriesBeforeAnyResubmission(t *testing.T) {
 	input := testOperationRequest("op_sending", "provider_a")
 	store := NewMemoryStore()
 	seedOperation(t, store, input, StatusSending)
+	ageMemoryOperation(store, input.OperationID, 10*time.Second)
 	service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
 	op, err := service.Execute(context.Background(), input)
 	if err != nil {
@@ -1071,6 +1235,43 @@ func TestUnknownOperationResubmitsSameKeyOnlyAfterConclusiveNotFound(t *testing.
 	}
 }
 
+func TestConclusiveNotFoundCapabilityFalseNeverResubmits(t *testing.T) {
+	var getCalls atomic.Int32
+	var postCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			writeError(w, http.StatusNotFound, "operation_not_found", "not found")
+		case http.MethodPost:
+			postCalls.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer provider.Close()
+
+	input := testOperationRequest("op_capability_false", "provider_a")
+	store := NewMemoryStore()
+	seedOperation(t, store, input, StatusUnknown)
+	service, err := NewService(Config{
+		Environment: "test", ProviderKinds: map[string]string{"provider_a": "provider_a"},
+		ProviderConnectionRevisions: map[string]string{"provider_a": "provider_a_v1"},
+		ProviderNamespaceIDs:        map[string]string{"provider_a": "provider_a"},
+		ProviderConclusiveAbsence:   map[string]bool{"provider_a": false},
+		ProviderEndpoints:           map[string]string{"provider_a": provider.URL},
+		WebhookBaseURL:              "http://gateway.test", WebhookSecrets: map[string]string{"provider_a": "test-secret"},
+	}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, err := service.Execute(t.Context(), input)
+	if err != nil || op.Status != StatusUnknown || op.SideEffectCertainty != "possible" || getCalls.Load() != 1 || postCalls.Load() != 0 {
+		t.Fatalf("disabled capability changed money path: op=%+v get=%d post=%d err=%v", op, getCalls.Load(), postCalls.Load(), err)
+	}
+}
+
 func TestCreatedOperationReconcileSignalsPaymentToResubmit(t *testing.T) {
 	input := testOperationRequest("op_created_query", "provider_a")
 	store := NewMemoryStore()
@@ -1087,6 +1288,110 @@ func TestCreatedOperationReconcileSignalsPaymentToResubmit(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound || !strings.Contains(response.Body.String(), "operation_resubmit_required") {
 		t.Fatalf("HTTP reconcile status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestStructuredRecoveryInspectionBindsTheWholeV2Command(t *testing.T) {
+	input := testOperationRequest("op_proven_created", "provider_a")
+	store := NewMemoryStore()
+	seedOperation(t, store, input, StatusCreated)
+	service := newTestService(t, store, map[string]string{"provider_a": "http://127.0.0.1:1"})
+	handler := NewHTTPHandler(service, store, "internal-secret")
+	requestURL := func(requestHash string) string {
+		query := url.Values{
+			"reconcile": {"true"}, "attempt_id": {input.AttemptID},
+			"provider_connection_id":       {input.ProviderConnectionID},
+			"provider_connection_revision": {input.ProviderConnectionRevision},
+			"provider_namespace_id":        {input.ProviderNamespaceID}, "provider": {input.Provider},
+			"provider_idempotency_key": {input.OperationID}, "request_hash": {requestHash},
+		}
+		return "/internal/v1/provider-operations/" + input.OperationID + "?" + query.Encode()
+	}
+	request := httptest.NewRequest(http.MethodGet, requestURL(operationHashV2(input)), nil)
+	request.Header.Set("X-Internal-Token", "internal-secret")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("proof response status=%d body=%s", response.Code, response.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+		Recovery RecoveryEvidence `json:"recovery"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Code != "operation_resubmit_required" || body.Recovery.Kind != "gateway_never_dispatched" ||
+		body.Recovery.OperationID != input.OperationID || body.Recovery.AttemptID != input.AttemptID ||
+		body.Recovery.ProviderConnectionID != input.ProviderConnectionID ||
+		body.Recovery.ProviderConnectionRevision != input.ProviderConnectionRevision ||
+		body.Recovery.ProviderNamespaceID != input.ProviderNamespaceID || body.Recovery.Provider != input.Provider ||
+		body.Recovery.ProviderIdempotencyKey != input.OperationID || body.Recovery.RequestHash != operationHashV2(input) ||
+		body.Recovery.ObservedAt.IsZero() || !body.Recovery.ValidUntil.After(body.Recovery.ObservedAt) {
+		t.Fatalf("proof did not bind the stored command: %+v", body)
+	}
+
+	changed := httptest.NewRequest(http.MethodGet, requestURL(strings.Repeat("0", 64)), nil)
+	changed.Header.Set("X-Internal-Token", "internal-secret")
+	rejected := httptest.NewRecorder()
+	handler.ServeHTTP(rejected, changed)
+	if rejected.Code != http.StatusConflict || !strings.Contains(rejected.Body.String(), "operation_id_reused") {
+		t.Fatalf("changed payload was accepted: status=%d body=%s", rejected.Code, rejected.Body.String())
+	}
+}
+
+func TestUnstructuredProvider404RemainsUnknownWithoutResubmit(t *testing.T) {
+	for name, body := range map[string]string{
+		"non JSON proxy body":    "proxy 404",
+		"unexpected JSON fields": `{"error":{"code":"operation_not_found","message":"not found"},"proxy":"edge"}`,
+		"oversized trailing bytes": `{"error":{"code":"operation_not_found","message":"not found"}}` +
+			strings.Repeat(" ", (64<<10)+1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			var getCalls, postCalls atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					getCalls.Add(1)
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = io.WriteString(w, body)
+					return
+				}
+				postCalls.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			defer provider.Close()
+			input := testOperationRequest("op_unproven_404_"+strings.ReplaceAll(name, " ", "_"), "provider_a")
+			store := NewMemoryStore()
+			seedOperation(t, store, input, StatusUnknown)
+			service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
+			op, err := service.Execute(t.Context(), input)
+			if err != nil || op.Status != StatusUnknown || op.SideEffectCertainty != "possible" || getCalls.Load() != 1 || postCalls.Load() != 0 {
+				t.Fatalf("ordinary 404 changed money path: op=%+v get=%d post=%d err=%v", op, getCalls.Load(), postCalls.Load(), err)
+			}
+		})
+	}
+}
+
+func TestExpiredLocalRecoveryWindowStopsBeforeProviderIO(t *testing.T) {
+	var calls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+	input := testOperationRequest("op_window_expired", "provider_a")
+	store := NewMemoryStore()
+	op := seedOperation(t, store, input, StatusCreated)
+	store.mu.Lock()
+	op.CreatedAt = time.Now().UTC().Add(-localRecoveryWindow - time.Minute)
+	store.operations[op.OperationID] = op
+	store.mu.Unlock()
+	service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
+	result, err := service.Execute(t.Context(), input)
+	if err != nil || result.Status != StatusReview || calls.Load() != 0 {
+		t.Fatalf("expired key reached provider: operation=%+v calls=%d err=%v", result, calls.Load(), err)
 	}
 }
 
@@ -1141,6 +1446,24 @@ func TestAuthorizedResponseDoesNotBecomeCapturedSuccess(t *testing.T) {
 	}
 	if op.Status != StatusUnknown || op.SideEffectCertainty != "possible" {
 		t.Fatalf("authorization-only response was treated as captured: %+v", op)
+	}
+}
+
+func TestUnsupportedProviderStatusRequiresReview(t *testing.T) {
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, providerResponse{
+			Provider: "provider_a", OperationID: "op_protocol_drift", ProviderReference: "ref_protocol_drift", Status: "settled_magic",
+		})
+	}))
+	defer provider.Close()
+	store := NewMemoryStore()
+	service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
+	op, err := service.Execute(context.Background(), testOperationRequest("op_protocol_drift", "provider_a"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Status != StatusReview || op.SideEffectCertainty != "possible" || op.FailureCode != "unsupported_provider_status" {
+		t.Fatalf("unknown Provider protocol value remained automatically recoverable: %+v", op)
 	}
 }
 
@@ -1201,6 +1524,7 @@ func TestProviderResponseIdentityMismatchRequiresReview(t *testing.T) {
 		input := testOperationRequest("op_identity_query", "provider_a")
 		store := NewMemoryStore()
 		seedOperation(t, store, input, StatusSending)
+		ageMemoryOperation(store, input.OperationID, 10*time.Second)
 		service := newTestService(t, store, map[string]string{"provider_a": provider.URL})
 		op, err := service.Get(context.Background(), input.OperationID, true)
 		if err != nil {
@@ -1416,15 +1740,17 @@ func newTestService(t *testing.T, store Store, providers map[string]string) *Ser
 	providerKinds := make(map[string]string, len(providers))
 	revisions := make(map[string]string, len(providers))
 	namespaces := make(map[string]string, len(providers))
+	conclusiveAbsence := make(map[string]bool, len(providers))
 	for connectionID := range providers {
 		secrets[connectionID] = "test-secret"
 		providerKinds[connectionID] = connectionID
 		revisions[connectionID] = connectionID + "_v1"
 		namespaces[connectionID] = connectionID
+		conclusiveAbsence[connectionID] = true
 	}
 	service, err := NewService(Config{
 		Environment: "test", ProviderKinds: providerKinds, ProviderConnectionRevisions: revisions,
-		ProviderNamespaceIDs: namespaces, ProviderEndpoints: providers,
+		ProviderNamespaceIDs: namespaces, ProviderConclusiveAbsence: conclusiveAbsence, ProviderEndpoints: providers,
 		WebhookBaseURL: "http://gateway.test", WebhookSecrets: secrets, ProviderTimeout: 500 * time.Millisecond,
 	}, store, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
@@ -1455,12 +1781,31 @@ func seedOperation(t *testing.T, store Store, input OperationRequest, status str
 	}
 	if status == StatusCreated {
 		op.SideEffectCertainty = "none"
+	} else if status != StatusReview {
+		// Seeded active or terminal operations represent a history in which a
+		// provider dispatch already happened. This is deliberately broader than
+		// statusRecordsDispatch, which answers whether the current transition is
+		// the one that records the first outbound call.
+		op.FirstDispatchedAt = &now
 	}
 	stored, created, err := store.CreateOrGet(context.Background(), op)
 	if err != nil || !created {
 		t.Fatalf("seed operation: created=%v operation=%+v err=%v", created, stored, err)
 	}
 	return stored
+}
+
+func ageMemoryOperation(store *MemoryStore, operationID string, age time.Duration) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	op := store.operations[operationID]
+	instant := time.Now().UTC().Add(-age)
+	op.CreatedAt, op.UpdatedAt = instant, instant
+	if op.FirstDispatchedAt != nil {
+		first := instant
+		op.FirstDispatchedAt = &first
+	}
+	store.operations[operationID] = op
 }
 
 func testWebhookEvent(outcome ProviderOutcome) VerifiedWebhookEvent {

@@ -154,6 +154,9 @@ func TestPipelineReplayCanExplainExpiredSnapshotButOnlineExecutionCannotUseIt(t 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if want := testfixture.Now.Add(30 * time.Second); !result.ExecutableUntil.Equal(want) {
+		t.Fatalf("decision deadline=%s want descriptor deadline %s", result.ExecutableUntil, want)
+	}
 	if !engine.ExecutableAt(result, testfixture.Now) || engine.ExecutableAt(result, testfixture.Now.Add(time.Minute)) {
 		t.Fatal("expired descriptor extended by old Context")
 	}
@@ -168,5 +171,23 @@ func TestPipelineReplayCanExplainExpiredSnapshotButOnlineExecutionCannotUseIt(t 
 	encoded, _ := json.Marshal(after)
 	if string(before) != string(encoded) {
 		t.Fatal("wall clock leaked into replay")
+	}
+}
+
+func TestExecutableDeadlineCanonicalizesDownToDurableMicroseconds(t *testing.T) {
+	cfg := config()
+	raw := testfixture.Now.Add(30*time.Second + 123456789*time.Nanosecond)
+	cfg.CapabilityCatalog.Descriptors[0].ExpiresAt = raw
+	engine := newEngine(t, cfg)
+	result, err := engine.Decide(testfixture.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := raw.Truncate(time.Microsecond)
+	if !result.ExecutableUntil.Equal(want) || result.ExecutableUntil.After(raw) || result.ExecutableUntil.Nanosecond()%1000 != 0 {
+		t.Fatalf("deadline=%s raw=%s want=%s", result.ExecutableUntil, raw, want)
+	}
+	if !engine.ExecutableAt(result, want.Add(-time.Nanosecond)) || engine.ExecutableAt(result, want) {
+		t.Fatal("microsecond canonicalization changed the half-open execution boundary")
 	}
 }

@@ -33,7 +33,28 @@ func v2Decision(t *testing.T, snapshot routingcontext.Context) RoutingDecision {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return RoutingDecision{DecisionID: "route_test", SelectedCandidate: RouteCandidate{CandidateID: "conn_us", ConnectionRevision: "v1", ProviderNamespaceID: "account_us", Provider: "simulator_a", MerchantAccount: "merchant_us", Connector: "simulator", Region: "us"}, CandidateOrder: []string{"conn_us"}, PolicyVersion: "rules.v1", ContextSchemaVersion: routingcontext.SchemaVersion, ContextDigest: digest, RuleSetVersion: "rules.v1", RuleSetDigest: "sha256:" + strings.Repeat("1", 64), CapabilityCatalogVersion: "catalog.v1", CapabilityCatalogDigest: "sha256:" + strings.Repeat("2", 64), Eligibility: []EligibilityEvidence{{CandidateID: "conn_us", Status: "eligible"}}}
+	decision := RoutingDecision{SelectedCandidate: RouteCandidate{CandidateID: "conn_us", ConnectionRevision: "v1", ProviderNamespaceID: "account_us", Provider: "simulator_a", MerchantAccount: "merchant_us", Connector: "simulator", Region: "us"}, CandidateOrder: []string{"conn_us"}, Exclusions: []CandidateExclusion{}, PolicyVersion: "rules.v1", ContextSchemaVersion: routingcontext.SchemaVersion, ContextDigest: digest, ExecutableUntil: snapshot.BuiltAt.Add(time.Minute), RuleSetVersion: "rules.v1", RuleSetDigest: "sha256:" + strings.Repeat("1", 64), CapabilityCatalogVersion: "catalog.v1", CapabilityCatalogDigest: "sha256:" + strings.Repeat("2", 64), RuleHits: []RuleHit{}, Eligibility: []EligibilityEvidence{{CandidateID: "conn_us", Status: "eligible"}}, ReasonCodes: []string{}}
+	decision.DecisionID = versionedDecisionContentID(decision)
+	return decision
+}
+
+func freezeRouterClientAt(client *RouterClient, at time.Time) {
+	client.now = func() time.Time { return at }
+}
+
+func TestVersionedDecisionContentIDSurvivesPaymentSnapshotRoundTrip(t *testing.T) {
+	decision := v2Decision(t, v2Context(t))
+	payload, err := json.Marshal(decision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored RoutingDecision
+	if err := json.Unmarshal(payload, &restored); err != nil {
+		t.Fatal(err)
+	}
+	if !validVersionedDecisionID(restored) {
+		t.Fatalf("stored decision no longer matches %s: %s", decision.DecisionID, payload)
+	}
 }
 
 func TestRouterV2SendsOnlyTheFrozenNonCredentialEnvelope(t *testing.T) {
@@ -64,6 +85,7 @@ func TestRouterV2SendsOnlyTheFrozenNonCredentialEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	freezeRouterClientAt(client, snapshot.BuiltAt)
 	decision, err := client.Decide(t.Context(), RoutingRequest{Context: &snapshot})
 	if err != nil || decision.SelectedCandidate.CandidateID != "conn_us" {
 		t.Fatalf("decision=%+v, err=%v", decision, err)
@@ -106,6 +128,7 @@ func TestRouterV2RejectsMismatchedEvidenceAndNeverFallsBackToV1(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			freezeRouterClientAt(client, snapshot.BuiltAt)
 			if _, err := client.Decide(t.Context(), RoutingRequest{Context: &snapshot}); !errors.Is(err, ErrUpstream) || calls != 1 {
 				t.Fatalf("err=%v calls=%d", err, calls)
 			}
@@ -120,6 +143,8 @@ func TestRouterV2NoEligiblePreservesEvidence(t *testing.T) {
 		decision.SelectedCandidate = RouteCandidate{}
 		decision.CandidateOrder = []string{}
 		decision.ReasonCodes = []string{"no_eligible_candidate"}
+		decision.Error = &RouterErrorEvidence{Code: "no_eligible_provider", Message: "no eligible provider"}
+		decision.DecisionID = versionedDecisionContentID(decision)
 		w.WriteHeader(http.StatusUnprocessableEntity)
 		_ = json.NewEncoder(w).Encode(decision)
 	}))
@@ -128,8 +153,39 @@ func TestRouterV2NoEligiblePreservesEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	freezeRouterClientAt(client, snapshot.BuiltAt)
 	decision, err := client.Decide(t.Context(), RoutingRequest{Context: &snapshot})
 	if !errors.Is(err, ErrNoEligibleProvider) || decision.ContextDigest == "" || decision.RuleSetVersion != "rules.v1" {
 		t.Fatalf("no-eligible lost evidence: %+v, %v", decision, err)
+	}
+}
+
+func TestRouterV2RejectsExpiredOrExtendedExecutionAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		deadline func(routingcontext.Context) time.Time
+	}{
+		{"missing", func(routingcontext.Context) time.Time { return time.Time{} }},
+		{"expired at receipt", func(snapshot routingcontext.Context) time.Time { return snapshot.BuiltAt }},
+		{"sub-microsecond persistence ambiguity", func(snapshot routingcontext.Context) time.Time {
+			return snapshot.BuiltAt.Add(time.Minute + time.Nanosecond)
+		}},
+		{"extends context", func(snapshot routingcontext.Context) time.Time {
+			return snapshot.BuiltAt.Add(routingcontext.OnlineMaxAge + time.Nanosecond)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := v2Context(t)
+			decision := v2Decision(t, snapshot)
+			decision.ExecutableUntil = test.deadline(snapshot)
+			decision.DecisionID = versionedDecisionContentID(decision)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _ = json.NewEncoder(w).Encode(decision) }))
+			defer server.Close()
+			client, _ := NewRouterClient(server.URL, "internal-test", server.Client())
+			freezeRouterClientAt(client, snapshot.BuiltAt)
+			if _, err := client.Decide(t.Context(), RoutingRequest{Context: &snapshot}); !errors.Is(err, ErrUpstream) {
+				t.Fatalf("invalid execution authority accepted: %v", err)
+			}
+		})
 	}
 }

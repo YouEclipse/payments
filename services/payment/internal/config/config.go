@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -21,12 +22,18 @@ type Config struct {
 	UpstreamTimeout   time.Duration
 	ReconcileInterval time.Duration
 	ReconcileStaleAge time.Duration
+	MaxClockSkew      time.Duration
 	RouterAPIVersion  string
+	RiskMode          string
 	MerchantProfiles  []routingcontext.MerchantProfile
 }
 
 func Load() (Config, error) {
 	environment := valueOrDefault("PAYMENTS_ENVIRONMENT", "local")
+	routerDefault := "v2"
+	if isLocal(environment) {
+		routerDefault = "v3"
+	}
 	config := Config{
 		Environment:       environment,
 		HTTPAddr:          valueOrDefault("HTTP_ADDR", ":8080"),
@@ -37,8 +44,14 @@ func Load() (Config, error) {
 		UpstreamTimeout:   3 * time.Second,
 		ReconcileInterval: 2 * time.Second,
 		ReconcileStaleAge: 5 * time.Second,
-		RouterAPIVersion:  valueOrDefault("PAYMENT_ROUTER_API_VERSION", "v2"),
+		MaxClockSkew:      500 * time.Millisecond,
+		RouterAPIVersion:  valueOrDefault("PAYMENT_ROUTER_API_VERSION", routerDefault),
 	}
+	riskDefault := "unavailable"
+	if isLocal(environment) {
+		riskDefault = "local_fixture"
+	}
+	config.RiskMode = valueOrDefault("PAYMENT_RISK_MODE", riskDefault)
 	if config.DatabaseURL == "" {
 		return Config{}, errors.New("DATABASE_URL is required")
 	}
@@ -51,6 +64,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	if config.ReconcileStaleAge, err = duration("PAYMENT_RECONCILE_STALE_AGE", config.ReconcileStaleAge); err != nil {
+		return Config{}, err
+	}
+	if !isLocal(environment) && os.Getenv("PAYMENT_MAX_CLOCK_SKEW") == "" {
+		return Config{}, errors.New("PAYMENT_MAX_CLOCK_SKEW is required outside local/test")
+	}
+	if config.MaxClockSkew, err = duration("PAYMENT_MAX_CLOCK_SKEW", config.MaxClockSkew); err != nil {
 		return Config{}, err
 	}
 
@@ -68,10 +87,24 @@ func Load() (Config, error) {
 	if config.InternalToken == "" {
 		return Config{}, errors.New("INTERNAL_SERVICE_TOKEN is required outside local/test")
 	}
-	if config.RouterAPIVersion != "v1" && config.RouterAPIVersion != "v2" {
-		return Config{}, errors.New("PAYMENT_ROUTER_API_VERSION must be v1 or v2")
+	if !isLocal(environment) {
+		for name, raw := range map[string]string{"ROUTER_BASE_URL": config.RouterBaseURL, "PROVIDER_GATEWAY_BASE_URL": config.GatewayBaseURL} {
+			endpoint, parseErr := url.Parse(raw)
+			if parseErr != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil {
+				return Config{}, fmt.Errorf("%s must be an authenticated HTTPS endpoint outside local/test", name)
+			}
+		}
 	}
-	if config.RouterAPIVersion == "v2" {
+	if config.RouterAPIVersion != "v1" && config.RouterAPIVersion != "v2" && config.RouterAPIVersion != "v3" {
+		return Config{}, errors.New("PAYMENT_ROUTER_API_VERSION must be v1, v2 or v3")
+	}
+	if config.RiskMode != "local_fixture" && config.RiskMode != "unavailable" {
+		return Config{}, errors.New("PAYMENT_RISK_MODE must be local_fixture or unavailable")
+	}
+	if config.RiskMode == "local_fixture" && !isLocal(environment) {
+		return Config{}, errors.New("PAYMENT_RISK_MODE=local_fixture is forbidden outside local/test")
+	}
+	if config.RouterAPIVersion != "v1" {
 		spec := os.Getenv("PAYMENT_MERCHANT_PROFILES_JSON")
 		if spec == "" && isLocal(environment) && len(config.MerchantAPIKeys) == 1 && config.MerchantAPIKeys["merchant_demo"] != "" {
 			now := time.Now().UTC()
@@ -80,7 +113,7 @@ func Load() (Config, error) {
 		} else {
 			config.MerchantProfiles, err = routingcontext.DecodeProfiles(spec)
 			if err != nil {
-				return Config{}, errors.New("PAYMENT_MERCHANT_PROFILES_JSON must contain explicit valid merchant profiles for v2")
+				return Config{}, errors.New("PAYMENT_MERCHANT_PROFILES_JSON must contain explicit valid merchant profiles for versioned routing")
 			}
 		}
 		known := make(map[string]bool, len(config.MerchantProfiles))

@@ -49,7 +49,17 @@ func main() {
 		logger.Error("validate Router v2 configuration", "error", err)
 		os.Exit(1)
 	}
-	handler := httpapi.NewHandler(engine, logger).WithV2(v2)
+	v3, err := loadV3Engine(environment, os.Getenv("ROUTER_V3_CONFIG_JSON"), time.Now().UTC())
+	if err != nil {
+		logger.Error("validate Router v3 configuration", "error", err)
+		os.Exit(1)
+	}
+	requiredVersion := settingValue("ROUTER_REQUIRED_API_VERSION", "v1")
+	if requiredVersion != "v1" && requiredVersion != "v2" && requiredVersion != "v3" {
+		logger.Error("ROUTER_REQUIRED_API_VERSION must be v1, v2 or v3")
+		os.Exit(1)
+	}
+	handler := httpapi.NewHandler(engine, logger).WithV2(v2).WithV3(v3).WithRequiredVersion(requiredVersion)
 	mux := http.NewServeMux()
 	handler.Register(mux)
 

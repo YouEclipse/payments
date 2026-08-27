@@ -11,8 +11,8 @@
 ```mermaid
 flowchart LR
     Client["Merchant / Client"] -->|"HTTPS / Payment API"| Payment["Payment service"]
-    Payment -->|"Routing context"| Router["Router"]
-    Router -->|"Ranked decision + reasons"| Payment
+    Payment -->|"Frozen Context v1/v2 + bound Risk"| Router["Router"]
+    Router -->|"Hard gates + Optimization evidence + executable_until"| Payment
     Payment -->|"Normalized operation"| Gateway["Provider gateway"]
     Gateway -->|"Provider-specific request"| Provider["Provider endpoint"]
     Provider -->|"Result / webhook"| Gateway
@@ -38,6 +38,9 @@ Payment 服务提供公共支付 API，并拥有支付生命周期及自己的 P
 - 接收并去重 gateway 归一化后的 provider outcome；
 - 将未知结果送入查询和 reconciliation，而不是立即换路重试。
 - 从权威 Intent、商户配置和受控 metadata source 构建版本化、无支付凭证的 Context，并在准备 Attempt 的事务中冻结 Context/Decision 证据。
+- v3 从显式授权 Risk source 取得绑定业务投影的短期 decision；`unavailable` 永不降级成 allow，本地 fixture 在非 local/test 环境阻止启动。
+- 在首次 Provider I/O 前重新验证 Router 的排他 `executable_until`；过期进入 `review_required`。已 dispatch operation 之后固定原执行 identity，不重新路由或重新跑 Risk。
+- 对已发出 operation 默认只查询；只有 durable never-dispatched 事实或 Gateway 认证、完整绑定且仍新鲜的结构化 absence proof 才能授权原键原 payload 重提。
 
 第一阶段的 durable worker 可以和 payment HTTP 进程位于同一部署单元。若吞吐或故障隔离需要独立扩缩，可将 worker 拆成新二进制，但数据库所有权仍属于 payment 边界。
 
@@ -47,11 +50,15 @@ Router 接收已经规范化的 routing context，先执行币种、地区、支
 
 Router 候选项不是 PSP 品牌字符串，而是稳定 `candidate_id`：它同时标识 Provider、Merchant Account、Connector 与 Region，并返回 `connection_revision` 和 `provider_namespace_id`。Payment 将 ID 固定为 `provider_connection_id`，连同 revision、namespace 与 provider 持久化到 Attempt 和 Operation；Provider Gateway 只能执行这条精确连接。Provider 名称仍用于选择 adapter kind，但不能替代连接身份。Gateway 的不可变 revision registry 防止相同 ID/revision 被重新绑定到不同执行配置，详见 [ADR 0002](adr/0002-immutable-provider-connections.md)。
 
-默认在线路径为显式 v2：严格 Context admission → Capability 三值过滤 → 确定性规则 → 稳定候选顺序。RuleSet 与 Catalog 是 Router 拥有的独立不可变 artifact；force/split 不能把 ineligible/unknown 候选加回来。纯求值依赖冻结的 built_at，HTTP 入口另做当前时间与新鲜度检查。v1 仍为 reader-first 升级保留，Payment 不会在 v2 失败后静默调用 v1。[ADR 0003](adr/0003-versioned-routing-context.md)记录 wire golden、摘要规范、配置和持久化边界。
+本地默认在线路径为显式 v3：严格 `routing_context.v2` admission → Capability 三值硬过滤 → 确定性 RuleSet → Risk gate → Cost/observational Performance → versioned integer Scoring → 稳定候选顺序。RuleSet、Catalog 与 Optimization 是 Router 拥有的独立不可变 artifact；Risk、force/split 和 scoring 都不能把 ineligible/unknown 候选加回来。缺 feature 时只允许 profile 对整批 `static_order` 或 `reject`，不能逐候选猜默认值。纯求值依赖冻结 built_at；HTTP 入口另做当前时间检查，并返回绑定全部实际 authority 的排他 `executable_until`。
+
+v1/v2 reader 仍为 reader-first 升级保留，且没有单次请求失败后的自动降级。Payment 在非本地未设置版本时仍默认 v2；local/test 默认 v3。Router 的 `ROUTER_REQUIRED_API_VERSION` 将 readiness 只绑定部署被分配的 reader，避免未分配旧 reader 的 artifact 过期影响新 deployment。[ADR 0003](adr/0003-versioned-routing-context.md)记录 wire golden、Risk/Optimization 证据、摘要规范、配置和持久化边界。
 
 ### Provider Gateway
 
 Provider-gateway 是内部 provider 集成边界。它将统一支付操作映射为 provider-specific HTTP 请求、认证和错误类型，并把响应归一化后交还 payment。它不选择 provider、不拥有 Payment Intent，也不能把网络超时解释成确定失败。它拥有独立的 operation、webhook inbox 与 outbox schema，用于保证外部副作用调用和回调的幂等性；payment 不直接读取这些表。
+
+Gateway 的普通 not-found 不是资金副作用不存在的证明。恢复查询必须携带完整 operation/attempt/connection/revision/namespace/provider/idempotency-key/request-hash identity；只有 adapter 能给出 conclusive absence，或 Gateway durable row 证明从未 dispatch，才返回短有效期的 `gateway_recovery.v1` proof。proof 最多新鲜 5 秒并绑定 request-hash version 2；当前仅 local/test Simulator 路径实现，不能外推为真实 PSP 的幂等保留契约。
 
 ### Simulator
 
@@ -71,6 +78,8 @@ Provider-gateway 使用自己的 PostgreSQL outbox 向 payment 至少一次投�
 
 Payment inbox 会把无法关联、重复 ID 但 payload 不同以及违反领域不变量的 outcome 持久化到 quarantine。Provider reference 与 event ID 的碰撞域是稳定 namespace，recovery alias 与 canonical connection 不能借不同 ID 绕过检测；namespace 不是 webhook secret 的信任域，跨路径关联必须有显式 alias 授权。若同一 namespace 的 Provider reference 被两笔 Attempt 声称，两个 Payment Intent 都会在同一事务中标记为 `review_required`；已确认的成功事实不会回退，未终结的 operation 则进入不可自动领取的手工复核状态。授权证据与确定失败互相矛盾时采用相同处理，直到明确的 reversal、void 或人工处置证明资金状态。
 
+Payment recovery claim 使用持久化 policy version、首次 dispatch 时间、24 小时本地窗口、有限 budget、backoff、lease 与 claim generation。窗口和 budget 只是本仓库 local SALE policy，不是 Provider SLA。lease 能围住数据库 claim completion，但不能撤销已经飞出的 HTTP；同键重提的安全性仍依赖原 Provider identity/key/payload 和经过验证的 absence contract。deadline、budget、畸形 proof、identity drift 或冲突证据耗尽时进入 `review_required`，不会跨 PSP fallback。
+
 第一阶段不使用 Redis、Redis Pub/Sub、Kafka 或其他 broker。只有当跨边界消费者、持续高吞吐、长时间 replay 等需求被实际测量出来后，才引入消息基础设施，并继续通过 transactional outbox 避免数据库与 broker 双写。
 
 ## 核心请求路径
@@ -86,10 +95,11 @@ sequenceDiagram
 
     C->>P: Create Payment Intent + idempotency key
     P->>D: Insert intent / replay stored response
-    P->>R: Request eligible route
-    R-->>P: selected_candidate + reason codes
-    P->>D: Create attempt + frozen Context/Decision + durable work
-    P->>G: Execute SALE on fixed provider_connection_id
+    P->>R: Frozen Context v2 + bound Risk Decision
+    R-->>P: hard gates + Optimization + executable_until
+    P->>D: Create attempt + immutable Context/Decision + durable work
+    P->>P: Recheck now < executable_until
+    P->>G: Execute SALE on fixed connection/revision/key/payload
     G->>X: Provider-specific automatic-capture request
     alt Determinate response
         X-->>G: Success or decline
@@ -97,11 +107,19 @@ sequenceDiagram
         P->>D: Persist terminal transition
     else Timeout or response lost
         P->>D: Mark attempt UNKNOWN
-        P->>G: Query same operation and connection
+        P->>G: Query same operation and full execution identity
         G->>X: Provider-specific status query
-        X-->>G: Authoritative status
-        G-->>P: Normalized result
-        P->>D: Reconcile state
+        alt Authoritative status
+            X-->>G: succeeded / failed / pending
+            G-->>P: Normalized result
+            P->>D: Reconcile state
+        else Side effect remains possible
+            G-->>P: no conclusive absence proof
+            P->>D: Backoff and query again / review
+        else Fresh structured absence proof
+            G-->>P: gateway_recovery.v1 bound to identity + request hash
+            P->>G: Same operation, same key, same payload before proof expiry
+        end
     end
     P-->>C: Stable payment state
 ```
@@ -117,6 +135,8 @@ sequenceDiagram
 - `/metrics`：当前至少输出进程存活 gauge，并为后续有限基数的技术和业务指标保留稳定入口。
 
 当前服务使用结构化 JSON 日志，但第一阶段还没有完整的请求关联中间件。进入真实试运行前必须生成并传播 `request_id`，并在相关状态迁移日志中携带 `payment_intent_id`、`attempt_id` 和 provider 等非敏感关联字段。任何日志、trace、metric 或事件都不得包含 PAN、CVV、访问令牌或 provider 密钥。
+
+Router `/readyz` 由 `ROUTER_REQUIRED_API_VERSION` 选择 v1、v2 或 v3 authority。v2/v3 被选中时，引擎缺失或 Router-owned snapshots/profile 过期返回 503；其他可选 reader 的状态不影响本 deployment。reader-first rollout 必须先让目标 reader ready，再切换 Payment writer，且不会因一次 4xx/5xx 自动回退旧协议。
 
 进入真实试运行前仍需补齐请求延迟和错误率、状态迁移计数、provider 结果、outbox 深度与最老消息年龄、UNKNOWN 数量和 reconciliation 结果。支付 ID、商户 ID 和用户标识不能成为 metric label。
 

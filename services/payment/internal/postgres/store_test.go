@@ -3,10 +3,48 @@ package postgres
 import (
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/YouEclipse/payments/services/payment/internal/idempotency"
 	"github.com/jackc/pgx/v5"
 )
+
+func TestDatabaseClockMustStayInsideTheMeasuredProcessWindow(t *testing.T) {
+	start := time.Date(2026, 8, 27, 1, 2, 3, 0, time.UTC)
+	finish := start.Add(100 * time.Millisecond)
+	budget := 500 * time.Millisecond
+	for _, test := range []struct {
+		name       string
+		databaseAt time.Time
+		accepted   bool
+	}{
+		{name: "inside query interval", databaseAt: start.Add(50 * time.Millisecond), accepted: true},
+		{name: "at fast-clock budget edge", databaseAt: finish.Add(-budget), accepted: true},
+		{name: "at slow-clock budget edge", databaseAt: start.Add(budget), accepted: true},
+		{name: "process clock too fast", databaseAt: finish.Add(-budget - time.Nanosecond)},
+		{name: "process clock too slow", databaseAt: start.Add(budget + time.Nanosecond)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := databaseClockWithinProcessWindow(test.databaseAt, start, finish, budget); got != test.accepted {
+				t.Fatalf("accepted=%v, want %v", got, test.accepted)
+			}
+		})
+	}
+	if databaseClockWithinProcessWindow(start, finish, start, budget) {
+		t.Fatal("accepted a reversed process-clock window")
+	}
+	if databaseClockWithinProcessWindow(start, start, finish, 0) {
+		t.Fatal("accepted a zero clock-skew budget")
+	}
+	// An asymmetric response delay cannot hide a process clock that is two
+	// seconds slow: every possible offset must be safe, not merely one.
+	if databaseClockWithinProcessWindow(start.Add(2*time.Second), start, start.Add(3*time.Second), budget) {
+		t.Fatal("network uncertainty masked an unsafe slow process clock")
+	}
+	if databaseClockWithinProcessWindow(start.Add(550*time.Millisecond), start, start.Add(1100*time.Millisecond), budget) {
+		t.Fatal("round-trip uncertainty larger than twice the budget was accepted")
+	}
+}
 
 type fakeRow struct {
 	values []any
@@ -35,7 +73,7 @@ func (f fakeRow) Scan(dest ...any) error {
 func TestScanIdempotencyReturnsStableCompletedResponse(t *testing.T) {
 	hash := idempotency.Fingerprint("create_payment_intent", []byte(`{"amount_minor":100}`))
 	lookup, err := scanIdempotency(fakeRow{values: []any{
-		"create_payment_intent", hash, "completed", "pi_1", 201, []byte(`{"id":"pi_1"}`),
+		"create_payment_intent", hash, "completed", "pi_1", 201, []byte(`{"id":"pi_1"}`), idempotency.FingerprintVersion,
 	}}, "create_payment_intent", hash)
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +87,7 @@ func TestScanIdempotencyRejectsReusedKey(t *testing.T) {
 	storedHash := idempotency.Fingerprint("create_payment_intent", []byte(`{"amount_minor":100}`))
 	requestedHash := idempotency.Fingerprint("create_payment_intent", []byte(`{"amount_minor":200}`))
 	_, err := scanIdempotency(fakeRow{values: []any{
-		"create_payment_intent", storedHash, "completed", "pi_1", 201, []byte(`{}`),
+		"create_payment_intent", storedHash, "completed", "pi_1", 201, []byte(`{}`), idempotency.FingerprintVersion,
 	}}, "create_payment_intent", requestedHash)
 	if !errors.Is(err, ErrIdempotencyConflict) {
 		t.Fatalf("got %v, want ErrIdempotencyConflict", err)

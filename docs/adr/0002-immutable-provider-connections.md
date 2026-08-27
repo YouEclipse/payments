@@ -29,6 +29,11 @@ Attempt and Provider Operation. A composite foreign key prevents an Operation
 from drifting away from its Attempt. Every execute, query and normalized outcome
 must match this durable tuple. Capture, Void and Refund, when implemented, must
 inherit it from the original approved operation; they must not ask Router again.
+The versioned Router decision's `executable_until` is checked immediately before
+the first Provider I/O. It is not a reason to reroute an expired operation: a
+never-dispatched operation fails closed, while an already-dispatched operation
+continues recovery on this frozen tuple without reevaluating today's Risk or
+Router configuration.
 
 Gateway maintains an append-only connection-revision registry. Reusing the same
 connection ID and revision with a different execution fingerprint fails startup
@@ -84,6 +89,14 @@ old revisions and their webhook authentication material until nonterminal
 operations, pending outbox records and the agreed late-event retention window
 have drained. Removing a mapping needed by a nonterminal operation makes
 Gateway readiness fail closed.
+
+Recovery queries also bind the operation/attempt tuple, Provider idempotency key
+and versioned request hash. A normal 404 or retryable hint does not prove that a
+funds side effect is absent. Same-key resubmission is allowed only when Payment's
+durable state proves the operation was never dispatched, or the authenticated
+Gateway supplies a fresh structured absence proof bound to every identity field
+and the original payload hash. Current proof minting is local/test-only; a real
+adapter needs an explicit Provider query/idempotency contract before enabling it.
 
 ## Consequences
 

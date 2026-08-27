@@ -47,6 +47,7 @@ paths:
         - InternalServiceToken: []
       requestBody:
         required: true
+        description: The exact signed JSON request body is limited to 65536 bytes.
         content:
           application/json:
             schema:
@@ -100,6 +101,33 @@ paths:
           schema:
             type: boolean
             default: false
+        - in: query
+          name: attempt_id
+          schema: { type: string }
+        - in: query
+          name: provider_connection_id
+          schema: { type: string }
+        - in: query
+          name: provider_connection_revision
+          schema: { type: string }
+        - in: query
+          name: provider_namespace_id
+          schema: { type: string }
+        - in: query
+          name: provider
+          schema: { type: string }
+        - in: query
+          name: provider_idempotency_key
+          schema: { type: string }
+        - in: query
+          name: request_hash
+          description: |
+            Gateway request_hash v2. When present, all recovery identity fields
+            above are required and a 404 may carry a validated RecoveryEvidence.
+            Their absence, or an ordinary 404, never grants resubmission.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
       responses:
         "200":
           description: Current normalized provider operation state.
@@ -137,6 +165,7 @@ paths:
           schema:
             type: string
             minLength: 1
+            maxLength: 128
         - in: header
           name: X-Provider-Signature
           required: true
@@ -291,25 +320,31 @@ components:
           format: date-time
     ProviderWebhookEvent:
       type: object
-      required: [event_id, provider, operation_id, status]
+      additionalProperties: false
+      required: [event_id, provider, operation_id, status, occurred_at]
       properties:
         event_id:
           type: string
           minLength: 1
+          maxLength: 256
         provider:
           type: string
           minLength: 1
+          maxLength: 128
           description: Must equal the provider kind configured for the path's provider_connection_id.
         operation_id:
           type: string
           minLength: 1
+          maxLength: 256
         provider_reference:
           type: string
+          maxLength: 512
         status:
           type: string
           enum: [authorized, captured, succeeded, declined, failed]
         failure_code:
           type: string
+          maxLength: 128
         occurred_at:
           type: string
           format: date-time
@@ -320,6 +355,58 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/APIError"
+        recovery:
+          $ref: "#/components/schemas/RecoveryEvidence"
+    RecoveryEvidence:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - kind
+        - request_hash_version
+        - operation_id
+        - attempt_id
+        - provider_connection_id
+        - provider_connection_revision
+        - provider_namespace_id
+        - provider
+        - provider_idempotency_key
+        - request_hash
+        - observed_at
+        - valid_until
+      properties:
+        schema_version:
+          type: string
+          enum: [gateway_recovery.v1]
+        kind:
+          type: string
+          enum: [gateway_operation_absent, gateway_never_dispatched, provider_conclusive_absent]
+        request_hash_version:
+          type: integer
+          enum: [2]
+        operation_id:
+          type: string
+        attempt_id:
+          type: string
+        provider_connection_id:
+          type: string
+        provider_connection_revision:
+          type: string
+        provider_namespace_id:
+          type: string
+        provider:
+          type: string
+        provider_idempotency_key:
+          type: string
+        request_hash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        observed_at:
+          type: string
+          format: date-time
+        valid_until:
+          type: string
+          format: date-time
     APIError:
       type: object
       additionalProperties: false

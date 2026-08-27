@@ -20,4 +20,5 @@
 
 # Local runtime data
 /tmp/
+/.validation-tmp/
 *.log

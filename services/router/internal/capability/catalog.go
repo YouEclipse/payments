@@ -178,6 +178,27 @@ func (c *Catalog) ValidAt(at time.Time) bool {
 	return !at.Before(c.artifact.EffectiveFrom) && !at.Before(c.artifact.PublishedAt) && at.Before(c.artifact.ExpiresAt)
 }
 
+// CandidatesAuthorityUntil is the exclusive deadline of the catalog and all
+// positively ordered descriptors. Excluded/unknown descriptors cannot be
+// resurrected by their expiry, matching CandidatesValidAt.
+func (c *Catalog) CandidatesAuthorityUntil(ids []string) (time.Time, bool) {
+	until := c.artifact.ExpiresAt
+	expires := make(map[string]time.Time, len(c.artifact.Descriptors))
+	for _, descriptor := range c.artifact.Descriptors {
+		expires[descriptor.CandidateID] = descriptor.ExpiresAt
+	}
+	for _, id := range ids {
+		expiry, exists := expires[id]
+		if !exists {
+			return time.Time{}, false
+		}
+		if expiry.Before(until) {
+			until = expiry
+		}
+	}
+	return until.UTC(), true
+}
+
 // Only positively selected candidates need this extra online check. A negative
 // or unknown descriptor remains excluded; it cannot be resurrected by expiry.
 func (c *Catalog) CandidatesValidAt(ids []string, at time.Time) bool {

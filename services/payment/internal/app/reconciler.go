@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/YouEclipse/payments/services/payment/internal/domain"
+	"github.com/YouEclipse/payments/services/payment/internal/postgres"
 )
 
 // RunReconciler closes the crash window between a durable operation and a
@@ -26,49 +26,30 @@ func (s *Service) RunReconciler(ctx context.Context, pollInterval, staleAge time
 }
 
 func (s *Service) reconcileBatch(ctx context.Context, staleAge time.Duration) {
-	now := s.now().UTC()
 	lease := staleAge
 	if minimumLease := 2 * s.upstreamTimeout; minimumLease > lease {
 		lease = minimumLease
 	}
-	operations, err := s.store.ClaimRecoverableOperations(ctx, now, staleAge, lease, 50)
-	if err != nil {
-		s.logger.Error("list recoverable provider operations", slog.String("error", err.Error()))
-		return
-	}
-	for _, recoverable := range operations {
+	// Reserve one call just before executing it. Leasing a sequential batch
+	// of fifty would spend budgets while later entries expire in our queue.
+	for completed := 0; completed < 50; completed++ {
 		if ctx.Err() != nil {
 			return
 		}
-		aggregate, err := s.store.GetAggregateByOperation(ctx, recoverable.OperationID)
+		if err := s.store.Ready(ctx, s.maxClockSkew); err != nil {
+			s.logger.Error("recovery paused because database clock witness is unavailable", slog.String("error", err.Error()))
+			return
+		}
+		operations, err := s.store.ClaimRecoverableOperations(ctx, s.now().UTC(), staleAge, lease, 1)
 		if err != nil {
-			s.logger.Error("load recoverable provider operation", slog.String("operation_id", recoverable.OperationID), slog.String("error", err.Error()))
-			continue
+			s.logger.Error("claim recoverable provider operation", slog.String("error", err.Error()))
+			return
 		}
-		var outcome domain.ProviderOutcome
-		switch recoverable.Status {
-		case domain.OperationCreated, domain.OperationRetryScheduled:
-			aggregate, err = s.store.MarkOperationSending(ctx, recoverable.OperationID, s.now().UTC())
-			if err != nil {
-				if !errors.Is(err, domain.ErrInvalidTransition) {
-					s.logger.Error("claim provider operation", slog.String("operation_id", recoverable.OperationID), slog.String("error", err.Error()))
-				}
-				continue
-			}
-			outcome = s.executeGateway(ctx, aggregate)
-		default:
-			// A stale SENDING operation may have reached the provider before the
-			// process died. Querying is safe; re-creating it is not.
-			outcome = s.queryGateway(ctx, aggregate)
+		if len(operations) == 0 {
+			return
 		}
-
-		applied, applyErr := s.applyOutcome(ctx, outcome)
-		if applyErr != nil && !errors.Is(applyErr, domain.ErrConflictingOutcome) {
-			s.logger.Error("reconcile provider outcome", slog.String("operation_id", recoverable.OperationID), slog.String("error", applyErr.Error()))
-			continue
-		}
-		if applied.Rejected {
-			s.logger.Error("reconciled outcome was quarantined", slog.String("operation_id", recoverable.OperationID))
+		if err := s.executeRecovery(ctx, operations[0]); err != nil && !errors.Is(err, postgres.ErrRecoveryClaimLost) {
+			s.logger.Error("recover provider operation", slog.String("operation_id", operations[0].OperationID), slog.String("error", err.Error()))
 		}
 	}
 }

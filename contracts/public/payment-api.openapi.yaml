@@ -25,11 +25,11 @@ paths:
   /readyz:
     get:
       operationId: getPaymentReadiness
-      summary: Report persistence readiness
+      summary: Report persistence and process-clock readiness
       security: []
       responses:
         "200":
-          description: Required persistence is available.
+          description: Required persistence is available and the Payment process clock is within its PostgreSQL-witnessed safety budget.
           content:
             application/json:
               schema:

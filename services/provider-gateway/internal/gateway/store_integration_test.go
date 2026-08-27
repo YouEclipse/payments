@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -33,7 +34,9 @@ func TestGatewayMigrationsCreateFreshIdentitySchema(t *testing.T) {
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schema+" CASCADE")
 	})
-	for version, migration := range []string{initialMigration, providerConnectionMigration} {
+	for version, migration := range []string{
+		initialMigration, providerConnectionMigration, recoveryInvariantMigration, providerObservationMigration, appendOnlyGuardMigration,
+	} {
 		if _, err := pool.Exec(ctx, strings.ReplaceAll(migration, "provider_gateway", schema)); err != nil {
 			t.Fatalf("apply isolated fresh migration %d: %v", version+1, err)
 		}
@@ -81,7 +84,7 @@ func TestGatewayMigrationsCreateFreshIdentitySchema(t *testing.T) {
 	}
 }
 
-func TestGatewayMigration0001To0002PreservesLegacyData(t *testing.T) {
+func TestGatewayMigration0001To0005PreservesLegacyDataAndSeedsEvidence(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
 		t.Skip("TEST_DATABASE_URL is not set")
@@ -100,6 +103,9 @@ func TestGatewayMigration0001To0002PreservesLegacyData(t *testing.T) {
 	})
 	v1 := strings.ReplaceAll(initialMigration, "provider_gateway", schema)
 	v2 := strings.ReplaceAll(providerConnectionMigration, "provider_gateway", schema)
+	v3 := strings.ReplaceAll(recoveryInvariantMigration, "provider_gateway", schema)
+	v4 := strings.ReplaceAll(providerObservationMigration, "provider_gateway", schema)
+	v5 := strings.ReplaceAll(appendOnlyGuardMigration, "provider_gateway", schema)
 	if _, err := pool.Exec(ctx, v1); err != nil {
 		t.Fatalf("apply isolated 0001: %v", err)
 	}
@@ -151,6 +157,15 @@ func TestGatewayMigration0001To0002PreservesLegacyData(t *testing.T) {
 	if _, err := pool.Exec(ctx, v2); err != nil {
 		t.Fatalf("apply isolated 0002: %v", err)
 	}
+	if _, err := pool.Exec(ctx, v3); err != nil {
+		t.Fatalf("apply isolated 0003: %v", err)
+	}
+	if _, err := pool.Exec(ctx, v4); err != nil {
+		t.Fatalf("apply isolated 0004: %v", err)
+	}
+	if _, err := pool.Exec(ctx, v5); err != nil {
+		t.Fatalf("apply isolated 0005: %v", err)
+	}
 	var adoptedRevisionCount int
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM %s.provider_connection_revisions`, schema)).Scan(&adoptedRevisionCount); err != nil {
 		t.Fatal(err)
@@ -161,14 +176,15 @@ func TestGatewayMigration0001To0002PreservesLegacyData(t *testing.T) {
 
 	var connectionID, revision, namespaceID, requestHash string
 	var hashVersion int
+	var firstDispatchedAt *time.Time
 	if err := pool.QueryRow(ctx, fmt.Sprintf(`
-			SELECT provider_connection_id,provider_connection_revision,provider_namespace_id,request_hash_version,request_hash
+			SELECT provider_connection_id,provider_connection_revision,provider_namespace_id,request_hash_version,request_hash,first_dispatched_at
 			FROM %s.operations WHERE operation_id=$1`, schema), input.OperationID).
-		Scan(&connectionID, &revision, &namespaceID, &hashVersion, &requestHash); err != nil {
+		Scan(&connectionID, &revision, &namespaceID, &hashVersion, &requestHash, &firstDispatchedAt); err != nil {
 		t.Fatal(err)
 	}
 	if connectionID != input.Provider || revision != legacyConnectionRevision || namespaceID != input.Provider ||
-		hashVersion != requestHashVersionLegacy || requestHash != operationHashV1(input) {
+		hashVersion != requestHashVersionLegacy || requestHash != operationHashV1(input) || firstDispatchedAt != nil {
 		t.Fatalf("legacy operation migration connection=%q revision=%q namespace=%q version=%d hash=%q", connectionID, revision, namespaceID, hashVersion, requestHash)
 	}
 
@@ -221,6 +237,22 @@ func TestGatewayMigration0001To0002PreservesLegacyData(t *testing.T) {
 	}
 	if reviewCount != 2 || claimCount != 1 || observationCount != 2 || collisionOutboxCount != 2 {
 		t.Fatalf("collision repair review=%d claims=%d observations=%d outbox=%d", reviewCount, claimCount, observationCount, collisionOutboxCount)
+	}
+	var legacyEvidenceCount int
+	var payloadHashLength int
+	if err := pool.QueryRow(ctx, fmt.Sprintf(`
+		SELECT count(*), max(octet_length(payload_hash))
+		FROM %s.provider_operation_observations
+		WHERE source='legacy_seed'
+		  AND attempt_id <> ''
+		  AND provider_connection_revision='legacy_v1'
+		  AND raw_provider_status=normalized_status
+		  AND sanitized_payload->>'kind'='legacy_reduced_operation_snapshot'`, schema)).
+		Scan(&legacyEvidenceCount, &payloadHashLength); err != nil {
+		t.Fatal(err)
+	}
+	if legacyEvidenceCount != 2 || payloadHashLength != sha256.Size {
+		t.Fatalf("legacy evidence count=%d hash_length=%d", legacyEvidenceCount, payloadHashLength)
 	}
 }
 
@@ -316,6 +348,161 @@ func TestPostgresStoreAtomicallyUpgradesLegacyRequestHashWithoutConnectionDrift(
 	}
 }
 
+func TestPostgresGatewayOperationRecoveryInvariants(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	store, err := OpenPostgres(ctx, databaseURL, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	suffix := fmt.Sprint(now.UnixNano())
+	operationID := "op_gateway_invariant_" + suffix
+	op := Operation{
+		OperationID: operationID, AttemptID: "att_" + operationID,
+		ProviderConnectionID: "provider_invariant_primary", ProviderConnectionRevision: "provider_invariant_primary_v1",
+		ProviderNamespaceID: "provider_invariant", Provider: "provider_invariant",
+		ProviderIdempotencyKey: operationID, RequestHash: "request_hash_" + suffix,
+		RequestHashVersion: requestHashVersionConnection, LegacyRequestHash: "legacy_hash_" + suffix,
+		Status: StatusCreated, SideEffectCertainty: "none", CreatedAt: now, UpdatedAt: now,
+	}
+	if _, inserted, err := store.CreateOrGet(ctx, op); err != nil || !inserted {
+		t.Fatalf("create invariant operation: inserted=%v err=%v", inserted, err)
+	}
+	dispatched, err := store.SetStatus(ctx, operationID, StatusSending, "possible", "", "")
+	if err != nil || dispatched.FirstDispatchedAt == nil || dispatched.FirstDispatchedAt.Before(now) {
+		t.Fatalf("Created -> Sending did not atomically record first dispatch: operation=%+v err=%v", dispatched, err)
+	}
+
+	for _, test := range []struct {
+		name  string
+		query string
+		args  []any
+	}{
+		{"attempt", `UPDATE provider_gateway.operations SET attempt_id=$2 WHERE operation_id=$1`, []any{operationID, "att_drift"}},
+		{"connection", `UPDATE provider_gateway.operations SET provider_connection_id=$2 WHERE operation_id=$1`, []any{operationID, "provider_invariant_backup"}},
+		{"request_hash_v2", `UPDATE provider_gateway.operations SET request_hash=$2 WHERE operation_id=$1`, []any{operationID, "changed_hash"}},
+		{"created_at", `UPDATE provider_gateway.operations SET created_at=created_at + interval '1 second' WHERE operation_id=$1`, []any{operationID}},
+		{"first_dispatched_at", `UPDATE provider_gateway.operations SET first_dispatched_at=first_dispatched_at + interval '1 second' WHERE operation_id=$1`, []any{operationID}},
+		{"status_rollback", `UPDATE provider_gateway.operations SET status='created' WHERE operation_id=$1`, []any{operationID}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, updateErr := store.pool.Exec(ctx, test.query, test.args...)
+			requireGatewayCheckViolation(t, updateErr)
+		})
+	}
+
+	newUnknownID := "op_gateway_missing_marker_" + suffix
+	_, err = store.pool.Exec(ctx, `
+		INSERT INTO provider_gateway.operations
+		(operation_id,attempt_id,provider_connection_id,provider_connection_revision,provider_namespace_id,
+		 provider,provider_idempotency_key,request_hash,request_hash_version,status,side_effect_certainty,created_at,updated_at)
+		VALUES($1,$2,$3,$4,$5,$6,$1,$7,2,'unknown','possible',$8,$8)`,
+		newUnknownID, "att_"+newUnknownID, "provider_invariant_primary", "provider_invariant_primary_v1",
+		"provider_invariant", "provider_invariant", "hash_missing_marker_"+suffix, now)
+	requireGatewayCheckViolation(t, err)
+
+	reviewID := "op_gateway_predispatch_review_" + suffix
+	reviewSeed := op
+	reviewSeed.OperationID = reviewID
+	reviewSeed.AttemptID = "att_" + reviewID
+	reviewSeed.ProviderIdempotencyKey = reviewID
+	reviewSeed.RequestHash = "hash_" + reviewID
+	reviewSeed.LegacyRequestHash = "legacy_" + reviewID
+	if _, inserted, err := store.CreateOrGet(ctx, reviewSeed); err != nil || !inserted {
+		t.Fatalf("create review seed: inserted=%v err=%v", inserted, err)
+	}
+	reviewed, err := store.SetStatus(ctx, reviewID, StatusReview, "possible", "", "dispatch_authority_expired")
+	if err != nil || reviewed.FirstDispatchedAt != nil || reviewed.Status != StatusReview {
+		t.Fatalf("pre-dispatch review invented a dispatch: operation=%+v err=%v", reviewed, err)
+	}
+
+	// The application clock may lead PostgreSQL. ClaimDispatch must use the DB
+	// clock without violating first_dispatched_at >= created_at.
+	futureID := "op_gateway_future_created_" + suffix
+	futureSeed := op
+	futureSeed.OperationID = futureID
+	futureSeed.AttemptID = "att_" + futureID
+	futureSeed.ProviderIdempotencyKey = futureID
+	futureSeed.RequestHash = "hash_" + futureID
+	futureSeed.LegacyRequestHash = "legacy_" + futureID
+	futureSeed.CreatedAt = now.Add(5 * time.Minute)
+	futureSeed.UpdatedAt = futureSeed.CreatedAt
+	futureCreated, inserted, err := store.CreateOrGet(ctx, futureSeed)
+	if err != nil || !inserted {
+		t.Fatalf("create future-clock dispatch seed: inserted=%v err=%v", inserted, err)
+	}
+	futureClaim, claimed, err := store.ClaimDispatch(ctx, futureCreated, 10*time.Second)
+	if err != nil || !claimed || futureClaim.FirstDispatchedAt == nil || futureClaim.FirstDispatchedAt.Before(futureCreated.CreatedAt) {
+		t.Fatalf("future-clock PostgreSQL dispatch claim=%+v claimed=%v err=%v", futureClaim, claimed, err)
+	}
+
+	claimID := "op_gateway_claim_fence_" + suffix
+	claimSeed := op
+	claimSeed.OperationID = claimID
+	claimSeed.AttemptID = "att_" + claimID
+	claimSeed.ProviderIdempotencyKey = claimID
+	claimSeed.RequestHash = "hash_" + claimID
+	claimSeed.LegacyRequestHash = "legacy_" + claimID
+	createdClaim, inserted, err := store.CreateOrGet(ctx, claimSeed)
+	if err != nil || !inserted {
+		t.Fatalf("create dispatch claim seed: inserted=%v err=%v", inserted, err)
+	}
+	firstClaim, claimed, err := store.ClaimDispatch(ctx, createdClaim, 10*time.Second)
+	if err != nil || !claimed || firstClaim.FirstDispatchedAt == nil {
+		t.Fatalf("first PostgreSQL dispatch claim=%+v claimed=%v err=%v", firstClaim, claimed, err)
+	}
+	if active, err := store.DispatchInFlight(ctx, claimID); err != nil || !active {
+		t.Fatalf("database dispatch lease active=%v err=%v", active, err)
+	}
+	if current, claimed, err := store.ClaimDispatch(ctx, firstClaim, 10*time.Second); err != nil || claimed || current.Status != StatusSending {
+		t.Fatalf("active lease admitted another dispatch: current=%+v claimed=%v err=%v", current, claimed, err)
+	}
+	if _, err := store.pool.Exec(ctx, `
+		UPDATE provider_gateway.operations
+		SET dispatch_lease_until=clock_timestamp()-interval '1 microsecond'
+		WHERE operation_id=$1`, claimID); err != nil {
+		t.Fatal(err)
+	}
+	claimable, err := store.Get(ctx, claimID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondClaim, claimed, err := store.ClaimDispatch(ctx, claimable, 10*time.Second)
+	if err != nil || !claimed || !secondClaim.UpdatedAt.After(firstClaim.UpdatedAt) {
+		t.Fatalf("second PostgreSQL dispatch claim=%+v claimed=%v err=%v", secondClaim, claimed, err)
+	}
+	current, applied, err := store.SetStatusIfCurrent(
+		ctx, firstClaim, StatusUnknown, "possible", "", "provider_response_unknown",
+	)
+	if err != nil || applied || current.Status != StatusSending || !current.UpdatedAt.Equal(secondClaim.UpdatedAt) {
+		t.Fatalf("late PostgreSQL UNKNOWN overwrote newer claim: current=%+v applied=%v err=%v", current, applied, err)
+	}
+	current, applied, err = store.SetStatusIfCurrent(
+		ctx, secondClaim, StatusUnknown, "possible", "", "provider_response_unknown",
+	)
+	if err != nil || !applied || current.Status != StatusUnknown {
+		t.Fatalf("current PostgreSQL claim could not record UNKNOWN: current=%+v applied=%v err=%v", current, applied, err)
+	}
+	if active, err := store.DispatchInFlight(ctx, claimID); err != nil || active {
+		t.Fatalf("completed claim retained a dispatch lease: active=%v err=%v", active, err)
+	}
+}
+
+func requireGatewayCheckViolation(t *testing.T, err error) {
+	t.Helper()
+	var constraint *pgconn.PgError
+	if !errors.As(err, &constraint) || constraint.Code != "23514" {
+		t.Fatalf("constraint error=%v, want PostgreSQL 23514", err)
+	}
+}
+
 func TestPostgresStoreOperationAndWebhookOutbox(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {
@@ -372,6 +559,9 @@ func TestPostgresStoreOperationAndWebhookOutbox(t *testing.T) {
 	}
 	if unchanged.Status != StatusCreated || unchanged.ProviderReference != "" {
 		t.Fatalf("cross-provider webhook mutated operation: %+v", unchanged)
+	}
+	if dispatched, err := store.SetStatus(ctx, op.OperationID, StatusSending, "possible", "", ""); err != nil || dispatched.FirstDispatchedAt == nil {
+		t.Fatalf("mark operation dispatched before provider evidence: operation=%+v err=%v", dispatched, err)
 	}
 
 	outcome := ProviderOutcome{
@@ -430,7 +620,8 @@ func TestPostgresStoreWebhookCorrelationAndMonotonicity(t *testing.T) {
 		ProviderNamespaceID: "provider_it", Provider: "provider_it",
 		ProviderIdempotencyKey: "op_monotonic_" + suffix, RequestHash: "hash_it",
 		RequestHashVersion: requestHashVersionConnection, LegacyRequestHash: "legacy_hash_it", Status: StatusSucceeded,
-		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref_a_" + suffix, CreatedAt: now, UpdatedAt: now,
+		SideEffectCertainty: "confirmed", ProviderReference: "provider_ref_a_" + suffix,
+		FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 	}
 	if _, inserted, err := store.CreateOrGet(ctx, op); err != nil || !inserted {
 		t.Fatalf("create operation: inserted=%v err=%v", inserted, err)
@@ -494,7 +685,7 @@ func TestPostgresStoreNamespaceScopedWebhookAndReferenceCollisions(t *testing.T)
 			ProviderNamespaceID: identity.NamespaceID, Provider: identity.Provider,
 			ProviderIdempotencyKey: operationID, RequestHash: "hash_" + operationID,
 			RequestHashVersion: requestHashVersionConnection, LegacyRequestHash: "legacy_" + operationID,
-			Status: StatusUnknown, SideEffectCertainty: "possible", CreatedAt: now, UpdatedAt: now,
+			Status: StatusUnknown, SideEffectCertainty: "possible", FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})
 		if seedErr != nil || !inserted {
 			t.Fatalf("seed %s inserted=%v err=%v", operationID, inserted, seedErr)
@@ -643,7 +834,8 @@ func TestPostgresStoreAuthorizationAndFailureConflictInEitherOrder(t *testing.T)
 			ProviderConnectionID: "provider_it_us_primary", ProviderConnectionRevision: "provider_it_us_primary_v1",
 			ProviderNamespaceID: "provider_it", Provider: "provider_it", ProviderIdempotencyKey: id,
 			RequestHash: "hash_" + id, RequestHashVersion: requestHashVersionConnection,
-			LegacyRequestHash: "legacy_hash_" + id, Status: status, SideEffectCertainty: certainty, CreatedAt: now, UpdatedAt: now,
+			LegacyRequestHash: "legacy_hash_" + id, Status: status, SideEffectCertainty: certainty,
+			FirstDispatchedAt: &now, CreatedAt: now, UpdatedAt: now,
 		})
 		if err != nil || !inserted {
 			t.Fatalf("seed %s: inserted=%v err=%v", id, inserted, err)

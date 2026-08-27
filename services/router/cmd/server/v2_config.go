@@ -23,6 +23,9 @@ func loadV2Engine(environment, rawJSON string) (*decision.Engine, error) {
 	if err := strictjson.Decode([]byte(rawJSON), &config); err != nil {
 		return nil, fmt.Errorf("decode ROUTER_V2_CONFIG_JSON: %w", err)
 	}
+	if config.Optimization != nil {
+		return nil, fmt.Errorf("decode ROUTER_V2_CONFIG_JSON: optimization belongs to the explicit v3 endpoint")
+	}
 	return decision.NewEngine(config)
 }
 

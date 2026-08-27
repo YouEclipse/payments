@@ -11,9 +11,13 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+
+	"github.com/YouEclipse/payments/internal/riskdecision"
 )
 
 const SchemaVersion = "routing_context.v1"
+const RiskSchemaVersion = "routing_context.v2"
+const OnlineMaxAge = 5 * time.Minute
 
 const (
 	StateKnown         = "known"
@@ -64,11 +68,12 @@ type PaymentMethod struct {
 }
 
 type Context struct {
-	SchemaVersion string        `json:"context_schema_version"`
-	BuiltAt       time.Time     `json:"built_at"`
-	Base          Base          `json:"base"`
-	Merchant      Merchant      `json:"merchant"`
-	PaymentMethod PaymentMethod `json:"payment_method_context"`
+	SchemaVersion string                 `json:"context_schema_version"`
+	BuiltAt       time.Time              `json:"built_at"`
+	Base          Base                   `json:"base"`
+	Merchant      Merchant               `json:"merchant"`
+	PaymentMethod PaymentMethod          `json:"payment_method_context"`
+	Risk          *riskdecision.Decision `json:"risk,omitempty"`
 }
 
 var identifier = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
@@ -81,7 +86,7 @@ func ValidIdentifier(value string) bool { return identifier.MatchString(value) }
 
 func (c Context) Validate() error {
 	bad := func(field, message string) error { return &ValidationError{Field: field, Message: message} }
-	if c.SchemaVersion != SchemaVersion {
+	if c.SchemaVersion != SchemaVersion && c.SchemaVersion != RiskSchemaVersion {
 		return bad("context_schema_version", "unsupported schema version")
 	}
 	if !utcTime(c.BuiltAt) {
@@ -122,6 +127,15 @@ func (c Context) Validate() error {
 	if value := c.PaymentMethod.Network.Value; value != nil && !oneOf(*value, "visa", "mastercard", "amex", "discover", "jcb", "unionpay", "diners") {
 		return bad("payment_method_context.network", "unsupported network metadata")
 	}
+	if c.SchemaVersion == SchemaVersion && c.Risk != nil {
+		return bad("risk", "risk is not part of schema v1")
+	}
+	if c.SchemaVersion == RiskSchemaVersion {
+		subject, err := c.RiskSubjectDigest()
+		if err != nil || c.Risk == nil || c.Risk.Validate(c.BuiltAt, subject) != nil {
+			return bad("risk", "invalid risk evidence")
+		}
+	}
 	return nil
 }
 
@@ -132,7 +146,7 @@ func (c Context) ValidateOnline(now time.Time, maxAge time.Duration) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
-	if maxAge <= 0 || now.IsZero() || c.BuiltAt.After(now) || now.Sub(c.BuiltAt) > maxAge {
+	if maxAge <= 0 || now.IsZero() || c.BuiltAt.After(now) || !now.Before(c.BuiltAt.Add(maxAge)) {
 		return &ValidationError{Field: "built_at", Message: "snapshot is from the future or outside the online freshness window"}
 	}
 	for _, field := range c.observations() {
@@ -140,7 +154,43 @@ func (c Context) ValidateOnline(now time.Time, maxAge time.Duration) error {
 			return &ValidationError{Field: field.name, Message: "known observation expired before online admission"}
 		}
 	}
+	if c.Risk != nil && !now.Before(c.Risk.ExpiresAt) {
+		return &ValidationError{Field: "risk", Message: "risk evidence expired before online admission"}
+	}
 	return nil
+}
+
+// OnlineAuthorityUntil returns the exclusive upper bound enforced by
+// ValidateOnline. It is safe to bind into downstream execution evidence: a
+// consumer can only shorten this Context-owned authority, never extend it.
+func (c Context) OnlineAuthorityUntil(maxAge time.Duration) (time.Time, error) {
+	if err := c.Validate(); err != nil || maxAge <= 0 {
+		return time.Time{}, ErrInvalidContext
+	}
+	until := c.BuiltAt.Add(maxAge)
+	for _, field := range c.observations() {
+		if field.value.State == StateKnown && field.value.ExpiresAt != nil && field.value.ExpiresAt.Before(until) {
+			until = *field.value.ExpiresAt
+		}
+	}
+	if c.Risk != nil && c.Risk.ExpiresAt.Before(until) {
+		until = c.Risk.ExpiresAt
+	}
+	return until.UTC(), nil
+}
+
+func (c Context) RiskSubjectDigest() (string, error) {
+	payload, err := json.Marshal(struct {
+		SchemaVersion string        `json:"schema_version"`
+		Base          Base          `json:"base"`
+		Merchant      Merchant      `json:"merchant"`
+		PaymentMethod PaymentMethod `json:"payment_method_context"`
+	}{"risk_subject.v1", c.Base, c.Merchant, c.PaymentMethod})
+	if err != nil {
+		return "", ErrInvalidContext
+	}
+	hash := sha256.Sum256(payload)
+	return "sha256:" + hex.EncodeToString(hash[:]), nil
 }
 
 func validateObserved(field Observed, builtAt time.Time) error {
