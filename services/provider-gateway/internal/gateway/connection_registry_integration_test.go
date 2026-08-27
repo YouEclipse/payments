@@ -150,6 +150,18 @@ func TestPostgresConnectionRegistryNewRevisionCannotRecoverOldUnknown(t *testing
 		t.Fatal(err)
 	}
 	op := registrySeedUnknownOperation(t, ctx, store, connectionID, originalIdentity)
+	// Keep the UNKNOWN row alive for every startup-validation assertion below,
+	// then resolve only this test's durable operation through the production
+	// reducer. The provider registry is deliberately append-only, so deleting or
+	// truncating shared schema rows would both bypass the invariant and make this
+	// test unsafe to run alongside the rest of the PostgreSQL suite.
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		if _, err := store.SetStatus(cleanupCtx, op.OperationID, StatusReview, "possible", "", "test_fixture_resolved"); err != nil {
+			t.Errorf("resolve registry UNKNOWN test fixture: %v", err)
+		}
+	})
 	newIdentity := originalIdentity
 	newIdentity.ConnectionRevision = "registry_v2"
 	newBinding := registryBindingForTest(t, newIdentity, "https://next.registry.test", "registry-next-test-secret")

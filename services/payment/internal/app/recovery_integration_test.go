@@ -115,7 +115,8 @@ func TestTerminalEvidenceWinsRaceWithRoutingAuthorityReviewCAS(t *testing.T) {
 		ProviderConnectionRevision: aggregate.Operation.ProviderConnectionRevision,
 		ProviderNamespaceID:        aggregate.Operation.ProviderNamespaceID, Provider: aggregate.Operation.Provider,
 		Status: domain.OutcomeSucceeded, SideEffectCertainty: domain.SideEffectConfirmed,
-		ProviderPaymentReference: "provider_terminal_" + aggregate.Operation.ID,
+		ProviderPaymentReference:   "provider_terminal_" + aggregate.Operation.ID,
+		ProviderOperationReference: "provider_operation_terminal_" + aggregate.Operation.ID,
 	}, []byte(`{"status":"succeeded"}`), terminalAt, nil)
 	if err != nil || result.Aggregate.Operation.Status != domain.OperationSucceeded {
 		t.Fatalf("terminal evidence result=%+v err=%v", result, err)
@@ -156,7 +157,7 @@ func TestSynchronousRoutingAuthorityExpiryStopsBeforeFirstGatewayIO(t *testing.T
 	}
 	created, err := service.CreateIntent(ctx, "merchant_sync_expiry", "create_sync_expiry", CreateIntentInput{
 		MerchantReference: "order_sync_expiry", AmountMinor: 2599, Currency: "USD",
-		PaymentMethodToken: "pm_sync_expiry", CaptureMethod: string(domain.CaptureAutomatic),
+		PaymentMethodToken: "pm_sim_approved", CaptureMethod: string(domain.CaptureAutomatic),
 	})
 	if err != nil {
 		t.Fatal(err)

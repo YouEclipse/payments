@@ -20,7 +20,14 @@ import (
 func TestRecoveryBudgetDeadlineAndIdentitySurviveWorkerRestart(t *testing.T) {
 	store, pool, ctx := isolatedRecoveryStore(t)
 	aggregate, _, _ := prepareIntegrationAggregate(t, ctx, store, "durable_budget", true)
-	original := aggregate.Operation
+	// PostgreSQL persists timestamptz values at microsecond precision. Establish
+	// the restart baseline from a durable round trip instead of comparing a
+	// nanosecond-precision write result with a later database read.
+	durable, err := store.GetAggregateByOperation(ctx, aggregate.Operation.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := durable.Operation
 	now := original.UpdatedAt.Add(10 * time.Second)
 
 	for charged := 1; charged <= recovery.InitialBudget; charged++ {
@@ -38,7 +45,7 @@ func TestRecoveryBudgetDeadlineAndIdentitySurviveWorkerRestart(t *testing.T) {
 			t.Fatal(err)
 		}
 		if loaded.Operation.RecoveryIdentity() != original.RecoveryIdentity() ||
-			loaded.Operation.RecoveryDeadlineAt != original.RecoveryDeadlineAt ||
+			!loaded.Operation.RecoveryDeadlineAt.Equal(original.RecoveryDeadlineAt) ||
 			loaded.Operation.RecoveryBudgetRemaining != recovery.InitialBudget-charged ||
 			loaded.Operation.FirstDispatchedAt == nil || !loaded.Operation.FirstDispatchedAt.Equal(*original.FirstDispatchedAt) {
 			t.Fatalf("durable recovery identity reset: %+v", loaded.Operation)
@@ -138,7 +145,9 @@ func TestAlreadyDispatchedRecoveryDoesNotReinterpretExpiredRoutingAuthority(t *t
 	store, _, ctx := isolatedRecoveryStore(t)
 	preparedAt := time.Now().UTC()
 	prepared := prepareRecoveryWithRoutingEvidence(t, ctx, store, "expired_after_dispatch", preparedAt)
-	dispatched, err := store.MarkOperationSending(ctx, prepared.Operation.ID, preparedAt.Add(time.Minute))
+	// executable_until is exclusive. Dispatch well inside the authority window;
+	// the later recovery assertions intentionally run after that window expires.
+	dispatched, err := store.MarkOperationSending(ctx, prepared.Operation.ID, preparedAt.Add(time.Second))
 	if err != nil || dispatched.Operation.FirstDispatchedAt == nil {
 		t.Fatalf("fresh first dispatch was not recorded: aggregate=%+v err=%v", dispatched, err)
 	}
